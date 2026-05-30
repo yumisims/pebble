@@ -1,0 +1,4 @@
+track type=bedGraph name="Mock scaffold" description="Pebble demo coverage"
+scaffold	0	1500	30
+scaffold	200	250	0
+scaffold	700	850	999

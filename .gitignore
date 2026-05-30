@@ -1,0 +1,9 @@
+build/
+*.o
+*.a
+*.so
+*.dylib
+pebble
+pebble_tests
+pebble_io_tests
+Testing/
