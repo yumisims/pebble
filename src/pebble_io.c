@@ -494,6 +494,19 @@ pebble_io_status_t pebble_read_coverage(
     }
 }
 
+static int round_coverage(double value)
+{
+    if (value >= 0.0) {
+        return (int)(value + 0.5);
+    }
+    return (int)(value - 0.5);
+}
+
+int pebble_round_coverage(double value)
+{
+    return round_coverage(value);
+}
+
 pebble_io_status_t pebble_write_bedgraph(
     FILE *out,
     const char *chrom,
@@ -512,7 +525,7 @@ pebble_io_status_t pebble_write_bedgraph(
 
         pebble_output_interval(idx, start_offset, config, &start, &end);
 
-        if (fprintf(out, "%s\t%d\t%d\t%.2f\n", chrom, start, end, values[idx]) < 0) {
+        if (fprintf(out, "%s\t%d\t%d\t%d\n", chrom, start, end, round_coverage(values[idx])) < 0) {
             return PEBBLE_IO_ERR_IO;
         }
     }

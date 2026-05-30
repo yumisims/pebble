@@ -82,7 +82,7 @@ static void test_write_bedgraph_roundtrip(void)
 
     rewind(tmp);
     assert(fgets(line, sizeof(line), tmp) != NULL);
-    assert(strncmp(line, "scaffold\t0\t100\t30.00", 20) == 0);
+    assert(strncmp(line, "scaffold\t0\t100\t30\n", 20) == 0);
 
     fclose(tmp);
     pebble_coverage_batch_free(&batch);

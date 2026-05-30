@@ -236,7 +236,7 @@ static int run_demo(const pebble_config_t *config)
         int end = 0;
 
         pebble_output_interval(idx, 0, config, &start, &end);
-        printf("%d\t%d\t%.2f\n", start, end, smoothed_track[idx]);
+        printf("%d\t%d\t%d\n", start, end, pebble_round_coverage(smoothed_track[idx]));
     }
 
     free(smoothed_track);

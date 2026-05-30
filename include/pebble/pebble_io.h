@@ -83,6 +83,8 @@ void pebble_output_interval(
     int *interval_end
 );
 
+int pebble_round_coverage(double value);
+
 const char *pebble_io_status_string(pebble_io_status_t status);
 
 #endif /* PEBBLE_PEBBLE_IO_H */
