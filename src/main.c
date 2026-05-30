@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 typedef struct {
     pebble_config_t config;
@@ -62,10 +61,23 @@ static int parse_format(const char *text, pebble_input_format_t *format)
     return -1;
 }
 
+static int option_requires_value(char opt)
+{
+    switch (opt) {
+    case 'i':
+    case 'o':
+    case 'c':
+    case 'f':
+    case 'W':
+    case 'S':
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int parse_options(int argc, char **argv, cli_options_t *options)
 {
-    int opt = 0;
-
     options->config.window_size = 1000;
     options->config.step_size = 100;
     options->config.trim_low = 0.40;
@@ -77,51 +89,83 @@ static int parse_options(int argc, char **argv, cli_options_t *options)
     options->demo_mode = 0;
     options->format_set = 0;
 
-    while ((opt = getopt(argc, argv, "i:o:c:f:W:S:h")) != -1) {
-        switch (opt) {
-        case 'i':
-            options->input_path = optarg;
-            break;
-        case 'o':
-            options->output_path = optarg;
-            break;
-        case 'c':
-            options->chrom_filter = optarg;
-            break;
-        case 'f':
-            if (parse_format(optarg, &options->format) != 0) {
-                return -1;
-            }
-            options->format_set = 1;
-            break;
-        case 'W':
-            options->config.window_size = atoi(optarg);
-            break;
-        case 'S':
-            options->config.step_size = atoi(optarg);
-            break;
-        case 'h':
-            return -1;
-        default:
-            return -1;
-        }
-    }
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
 
-    for (int i = optind; i < argc; i++) {
-        if (strcmp(argv[i], "--demo") == 0) {
+        if (strcmp(arg, "--demo") == 0) {
             options->demo_mode = 1;
-        } else if (strcmp(argv[i], "--trim-low") == 0) {
+            continue;
+        }
+        if (strcmp(arg, "--trim-low") == 0) {
             if (i + 1 >= argc) {
                 return -1;
             }
             options->config.trim_low = atof(argv[++i]);
-        } else if (strcmp(argv[i], "--trim-high") == 0) {
+            continue;
+        }
+        if (strcmp(arg, "--trim-high") == 0) {
             if (i + 1 >= argc) {
                 return -1;
             }
             options->config.trim_high = atof(argv[++i]);
-        } else {
+            continue;
+        }
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             return -1;
+        }
+        if (arg[0] != '-' || arg[1] == '\0') {
+            return -1;
+        }
+
+        for (int j = 1; arg[j] != '\0'; j++) {
+            char opt = arg[j];
+            const char *val = NULL;
+
+            if (option_requires_value(opt)) {
+                if (arg[j + 1] != '\0') {
+                    val = arg + j + 1;
+                    j = (int)strlen(arg) - 1;
+                } else {
+                    if (i + 1 >= argc) {
+                        return -1;
+                    }
+                    val = argv[++i];
+                }
+            }
+
+            switch (opt) {
+            case 'i':
+                options->input_path = val;
+                break;
+            case 'o':
+                options->output_path = val;
+                break;
+            case 'c':
+                options->chrom_filter = val;
+                break;
+            case 'f':
+                if (val == NULL || parse_format(val, &options->format) != 0) {
+                    return -1;
+                }
+                options->format_set = 1;
+                break;
+            case 'W':
+                if (val == NULL) {
+                    return -1;
+                }
+                options->config.window_size = atoi(val);
+                break;
+            case 'S':
+                if (val == NULL) {
+                    return -1;
+                }
+                options->config.step_size = atoi(val);
+                break;
+            case 'h':
+                return -1;
+            default:
+                return -1;
+            }
         }
     }
 
@@ -188,10 +232,10 @@ static int run_demo(const pebble_config_t *config)
 
     printf("Interval_Start\tInterval_End\tSmoothed_Value\n");
     for (size_t idx = 0; idx < out_len; idx++) {
-        int center = (int)(idx * (size_t)config->step_size) + (config->window_size / 2);
-        int start = center - (config->step_size / 2);
-        int end = center + (config->step_size / 2);
+        int start = 0;
+        int end = 0;
 
+        pebble_output_interval(idx, 0, config, &start, &end);
         printf("%d\t%d\t%.2f\n", start, end, smoothed_track[idx]);
     }
 

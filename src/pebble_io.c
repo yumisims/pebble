@@ -1,7 +1,9 @@
 #include "pebble/pebble_io.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -79,6 +81,66 @@ static int is_header_line(const char *line)
     return 0;
 }
 
+static int copy_field(const char *start, const char *end, char *out, size_t out_cap)
+{
+    size_t len;
+
+    if (start == NULL || end == NULL || out == NULL || out_cap == 0U) {
+        return -1;
+    }
+    if (end < start) {
+        return -1;
+    }
+
+    len = (size_t)(end - start);
+    if (len >= out_cap) {
+        return -1;
+    }
+
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return 0;
+}
+
+static int parse_int_field(const char *text, int *out)
+{
+    char *end = NULL;
+    long value;
+
+    if (text == NULL || out == NULL || text[0] == '\0') {
+        return -1;
+    }
+
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0') {
+        return -1;
+    }
+    if (value < (long)INT_MIN || value > (long)INT_MAX) {
+        return -1;
+    }
+
+    *out = (int)value;
+    return 0;
+}
+
+static int parse_double_field(const char *text, double *out)
+{
+    char *end = NULL;
+
+    if (text == NULL || out == NULL || text[0] == '\0') {
+        return -1;
+    }
+
+    errno = 0;
+    *out = strtod(text, &end);
+    if (errno != 0 || end == text || *end != '\0') {
+        return -1;
+    }
+
+    return 0;
+}
+
 static pebble_io_status_t parse_interval_line(
     const char *line,
     char *chrom,
@@ -87,36 +149,66 @@ static pebble_io_status_t parse_interval_line(
     double *value,
     int use_score_field)
 {
-    char name[256];
-    char score_text[64];
-    int fields = 0;
+    char fields[6][256];
+    size_t field_count = 0U;
+    const char *cursor = line;
+    const char *field_end;
 
-    if (use_score_field) {
-        fields = sscanf(
-            line,
-            "%255s\t%d\t%d\t%255[^\t]\t%63[^\t\n]",
-            chrom,
-            start,
-            end,
-            name,
-            score_text
-        );
-        if (fields >= 5) {
-            *value = atof(score_text);
-            return PEBBLE_IO_OK;
+    while (field_count < 6U) {
+        field_end = strchr(cursor, '\t');
+        if (field_end == NULL) {
+            size_t tail = strcspn(cursor, "\r\n");
+            if (copy_field(cursor, cursor + (ptrdiff_t)tail, fields[field_count], sizeof(fields[0])) != 0) {
+                return PEBBLE_IO_ERR_PARSE;
+            }
+            if (fields[field_count][0] != '\0') {
+                field_count++;
+            }
+            break;
         }
-        if (fields >= 3) {
-            *value = 1.0;
-            return PEBBLE_IO_OK;
+
+        if (copy_field(cursor, field_end, fields[field_count], sizeof(fields[0])) != 0) {
+            return PEBBLE_IO_ERR_PARSE;
         }
-    } else {
-        fields = sscanf(line, "%255s\t%d\t%d\t%lf", chrom, start, end, value);
-        if (fields == 4) {
-            return PEBBLE_IO_OK;
-        }
+        field_count++;
+        cursor = field_end + 1;
     }
 
-    (void)name;
+    if (field_count < 3U) {
+        return PEBBLE_IO_ERR_PARSE;
+    }
+    if (parse_int_field(fields[1], start) != 0 || parse_int_field(fields[2], end) != 0) {
+        return PEBBLE_IO_ERR_PARSE;
+    }
+
+    if (use_score_field) {
+        if (field_count >= 5U) {
+            if (parse_double_field(fields[4], value) != 0) {
+                return PEBBLE_IO_ERR_PARSE;
+            }
+            memcpy(chrom, fields[0], 256U);
+            return PEBBLE_IO_OK;
+        }
+        if (field_count == 4U) {
+            if (parse_double_field(fields[3], value) != 0) {
+                return PEBBLE_IO_ERR_PARSE;
+            }
+            memcpy(chrom, fields[0], 256U);
+            return PEBBLE_IO_OK;
+        }
+        *value = 1.0;
+        memcpy(chrom, fields[0], 256U);
+        return PEBBLE_IO_OK;
+    }
+
+    if (field_count >= 4U) {
+        if (parse_double_field(fields[3], value) != 0) {
+            return PEBBLE_IO_ERR_PARSE;
+        }
+        memcpy(chrom, fields[0], 256U);
+        return PEBBLE_IO_OK;
+    }
+
     return PEBBLE_IO_ERR_PARSE;
 }
 
@@ -142,7 +234,18 @@ static pebble_io_status_t build_batch_from_extents(
     out->count = extents->count;
 
     for (size_t i = 0; i < extents->count; i++) {
-        size_t length = (size_t)(extents->items[i].max_end - extents->items[i].min_start);
+        int span = extents->items[i].max_end - extents->items[i].min_start;
+        size_t length;
+
+        if (span <= 0) {
+            pebble_coverage_batch_free(out);
+            return PEBBLE_IO_ERR_PARSE;
+        }
+        if ((size_t)span > SIZE_MAX / sizeof(int16_t)) {
+            pebble_coverage_batch_free(out);
+            return PEBBLE_IO_ERR_OOM;
+        }
+        length = (size_t)span;
         out->items[i].chrom = strdup(extents->items[i].chrom);
         out->items[i].start_offset = extents->items[i].min_start;
         out->items[i].length = length;
@@ -320,7 +423,11 @@ static pebble_io_status_t read_interval_file(
         return status;
     }
 
-    return fill_batch_from_file(path, use_score_field, chrom_filter, out);
+    status = fill_batch_from_file(path, use_score_field, chrom_filter, out);
+    if (status != PEBBLE_IO_OK) {
+        pebble_coverage_batch_free(out);
+    }
+    return status;
 }
 
 void pebble_coverage_batch_free(pebble_coverage_batch_t *batch)
@@ -353,6 +460,24 @@ pebble_io_status_t pebble_read_bed(
     return read_interval_file(path, chrom_filter, 1, out);
 }
 
+void pebble_output_interval(
+    size_t step_index,
+    int start_offset,
+    const pebble_config_t *config,
+    int *interval_start,
+    int *interval_end)
+{
+    int window_start;
+
+    if (config == NULL || interval_start == NULL || interval_end == NULL) {
+        return;
+    }
+
+    window_start = (int)(step_index * (size_t)config->step_size) + start_offset;
+    *interval_start = window_start;
+    *interval_end = window_start + config->step_size;
+}
+
 pebble_io_status_t pebble_read_coverage(
     const char *path,
     pebble_input_format_t format,
@@ -382,9 +507,10 @@ pebble_io_status_t pebble_write_bedgraph(
     }
 
     for (size_t idx = 0; idx < value_count; idx++) {
-        int center = (int)(idx * (size_t)config->step_size) + (config->window_size / 2) + start_offset;
-        int start = center - (config->step_size / 2);
-        int end = center + (config->step_size / 2);
+        int start = 0;
+        int end = 0;
+
+        pebble_output_interval(idx, start_offset, config, &start, &end);
 
         if (fprintf(out, "%s\t%d\t%d\t%.2f\n", chrom, start, end, values[idx]) < 0) {
             return PEBBLE_IO_ERR_IO;

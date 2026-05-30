@@ -1,0 +1,1 @@
+/usr/bin/cc -fsanitize=address -g -O0 -Wl,-search_paths_first -Wl,-headerpad_max_install_names -fsanitize=address CMakeFiles/pebble_io_tests.dir/tests/test_io.c.o -o pebble_io_tests  libpebble_core.a -lm

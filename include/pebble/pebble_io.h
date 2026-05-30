@@ -70,6 +70,19 @@ pebble_io_status_t pebble_write_bedgraph_file(
     size_t value_count
 );
 
+/*
+ * BedGraph interval for smoothed step `step_index`.
+ * The value is the trimmed mean of the window starting at interval_start
+ * and spanning config->window_size bases.
+ */
+void pebble_output_interval(
+    size_t step_index,
+    int start_offset,
+    const pebble_config_t *config,
+    int *interval_start,
+    int *interval_end
+);
+
 const char *pebble_io_status_string(pebble_io_status_t status);
 
 #endif /* PEBBLE_PEBBLE_IO_H */

@@ -44,6 +44,23 @@ static void test_read_mock_bed(void)
     pebble_coverage_batch_free(&batch);
 }
 
+static void test_read_genome2cov_bed(void)
+{
+    pebble_coverage_batch_t batch = {0};
+    pebble_io_status_t status = pebble_read_bed(
+        "examples/genome2cov_style.bed",
+        "HAP1_SCAFFOLD_1",
+        &batch
+    );
+
+    assert(status == PEBBLE_IO_OK);
+    assert(batch.count == 1U);
+    assert(batch.items[0].coverage[0] == 2);
+    assert(batch.items[0].coverage[93] == 42);
+
+    pebble_coverage_batch_free(&batch);
+}
+
 static void test_write_bedgraph_roundtrip(void)
 {
     pebble_config_t config = {
@@ -65,7 +82,7 @@ static void test_write_bedgraph_roundtrip(void)
 
     rewind(tmp);
     assert(fgets(line, sizeof(line), tmp) != NULL);
-    assert(strncmp(line, "scaffold\t450\t550\t30.00", 22) == 0);
+    assert(strncmp(line, "scaffold\t0\t100\t30.00", 20) == 0);
 
     fclose(tmp);
     pebble_coverage_batch_free(&batch);
@@ -75,6 +92,7 @@ int main(void)
 {
     test_read_mock_bedgraph();
     test_read_mock_bed();
+    test_read_genome2cov_bed();
     test_write_bedgraph_roundtrip();
 
     puts("all io tests passed");

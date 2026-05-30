@@ -1,6 +1,9 @@
 CC      = cc
 CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic -Iinclude
 LDFLAGS =
+ifeq ($(shell uname -s),Linux)
+LDFLAGS += -static
+endif
 LDLIBS  = -lm
 
 BUILD_DIR = build
