@@ -31,7 +31,41 @@ typedef struct {
     size_t count;
 } pebble_coverage_batch_t;
 
+typedef struct {
+    char *chrom;
+    int start;
+    int end;
+    double value;
+} pebble_bedgraph_record_t;
+
+typedef struct {
+    pebble_bedgraph_record_t *items;
+    size_t count;
+} pebble_bedgraph_batch_t;
+
 void pebble_coverage_batch_free(pebble_coverage_batch_t *batch);
+
+void pebble_bedgraph_batch_free(pebble_bedgraph_batch_t *batch);
+
+/*
+ * Sort loaded contigs by chromosome name, then start offset (bedtools sort order).
+ * Within each contig, pebble_write_bedgraph already emits rising start coordinates.
+ */
+void pebble_coverage_batch_sort(pebble_coverage_batch_t *batch);
+
+void pebble_bedgraph_batch_sort(pebble_bedgraph_batch_t *batch);
+
+pebble_io_status_t pebble_read_bedgraph_records(
+    const char *path,
+    const char *chrom_filter,
+    pebble_bedgraph_batch_t *out
+);
+
+pebble_io_status_t pebble_write_bedgraph_records(
+    FILE *out,
+    const pebble_bedgraph_record_t *records,
+    size_t count
+);
 
 pebble_io_status_t pebble_read_bedgraph(
     const char *path,

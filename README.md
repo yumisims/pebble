@@ -2,7 +2,7 @@
 
 **Author:** Yumi Sims
 
-Pebble is a command-line tool and C library for smoothing genomic sequencing coverage tracks. It reads per-base coverage from BED or BedGraph files, applies a sliding trimmed mean, and writes the result as BedGraph.
+Pebble is a command-line tool and C library for smoothing genomic sequencing coverage tracks. It reads per-base coverage from BED or BedGraph files, applies a sliding trimmed mean, and writes the result as BedGraph or BigWig.
 
 The algorithm follows the coverage-smoothing approach used in [stepStone](https://github.com/wtsi-hpag/stepStone) (`-denoise 1`): within each sliding window, extreme values are trimmed before averaging. This suppresses spikes from mapping artifacts, repeats, and other outliers while preserving broad coverage trends.
 
@@ -30,6 +30,14 @@ Contigs shorter than the window size are skipped. Smoothed values are **rounded 
 
 Requires a C11 compiler.
 
+Clone with submodules (needed for BigWig builds with `make PEBBLE_BIGWIG=1`):
+
+```bash
+git clone --recurse-submodules <repo-url>
+# or after a plain clone:
+git submodule update --init third_party/libBigWig
+```
+
 **Makefile:**
 
 ```bash
@@ -47,6 +55,16 @@ ctest --test-dir build
 
 The CLI binary is written to `build/pebble`.
 
+BigWig output is **optional** and off by default. Enable it when building if you need BigWig with `--sizes examples/chrom.sizes`:
+
+```bash
+cmake -S . -B build -DPEBBLE_BIGWIG=ON
+cmake --build build
+# or: make PEBBLE_BIGWIG=1
+```
+
+On Linux with static linking (the default), BigWig builds need the **static** zlib archive (`libz.a`, provided by `zlib1g-dev` on Debian/Ubuntu). If `libz.a` is missing, CMake will report an error; the Makefile falls back to a dynamic zlib link without `-static`.
+
 On Linux, CMake **statically links** executables by default so they run reliably on HPC systems where conda or other environments override `LD_LIBRARY_PATH`. To build dynamically instead:
 
 ```bash
@@ -62,23 +80,46 @@ LD_LIBRARY_PATH= ./build/pebble --demo
 
 ## Usage
 
+Example data in `examples/`:
+
+| File | Description |
+|------|-------------|
+| `example_cov.bed` | genome2cov-style 4-column BED (`chrom start end coverage`) for `scaffold_1` (~10k intervals) |
+| `chrom.sizes` | Chromosome/scaffold lengths (88 sequences) for BigWig output |
+
 ```bash
 # Built-in demo with mock coverage data
 ./build/pebble --demo
 
-# Smooth a BedGraph file
-./build/pebble -i examples/mock_scaffold.bedgraph -o smoothed.bedgraph
+# Smooth example coverage (genome2cov-style BED)
+./build/pebble -i examples/example_cov.bed -o build/example_cov.smoothed.bedgraph
 
-# Smooth genome2cov-style 4-column BED (chrom, start, end, coverage)
-./build/pebble -i genome2cov.bed -o smoothed.bedgraph
+# Single contig (example_cov.bed contains scaffold_1 only)
+./build/pebble -i examples/example_cov.bed -c scaffold_1 -o build/scaffold_1.smoothed.bedgraph
+
+# Smoothed BedGraph + BigWig (requires -DPEBBLE_BIGWIG=ON build)
+./build/pebble -i examples/example_cov.bed \
+  -o build/example_cov.smoothed.bedgraph \
+  --sizes examples/chrom.sizes
+# -> build/example_cov.smoothed.bedgraph + build/example_cov.smoothed.bw
+
+# BedGraph to BigWig without smoothing (pass-through; input must be .bedgraph)
+./build/pebble -i raw.bedgraph \
+  -o build/raw.bw \
+  --sizes examples/chrom.sizes \
+  --no-smooth
+```
+
+Other input types:
+
+```bash
+# BedGraph input
+./build/pebble -i track.bedgraph -o smoothed.bedgraph
 
 # Standard 6-column BED (score in column 5)
 ./build/pebble -i regions.bed -f bed -o smoothed.bedgraph
 
-# Single contig
-./build/pebble -i genome2cov.bed -c HAP1_SCAFFOLD_1 -o scaffold.bedgraph
-
-# Short contig (smaller window than default 1000)
+# Custom window/step (e.g. short contigs)
 ./build/pebble -i examples/genome2cov_style.bed -W 50 -S 10 -o smoothed.bedgraph
 ```
 
@@ -87,7 +128,10 @@ LD_LIBRARY_PATH= ./build/pebble --demo
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-i input` | Input BED or BedGraph file | — |
-| `-o output` | Output BedGraph file | stdout |
+| `-o output` | BedGraph output file | stdout |
+| `--sizes file` | Chromosome sizes (`name<TAB>length`); also writes a `.bw` alongside BedGraph | — |
+| `--no-smooth` | Convert BedGraph to BigWig without smoothing (requires BedGraph input, `--sizes`, `-o`) | off |
+| `--format-out bedgraph\|bigwig` | With `--sizes`, treat `-o` as BigWig basename when set to `bigwig` | BedGraph always; BigWig when `--sizes` given |
 | `-c chrom` | Process only the named chromosome or contig | all |
 | `-f bed\|bedgraph` | Input format | inferred from extension |
 | `-W window` | Sliding window size | 1000 |
@@ -97,6 +141,8 @@ LD_LIBRARY_PATH= ./build/pebble --demo
 | `--demo` | Run the built-in mock scaffold demo | — |
 
 If no input file is given, Pebble runs in demo mode.
+
+BigWig output uses [libBigWig](https://github.com/dpryan79/libBigWig). Enable it at build time with `-DPEBBLE_BIGWIG=ON` (CMake) or `make PEBBLE_BIGWIG=1`. **BedGraph is always written.** When `--sizes` is given, a BigWig file is also written (derived from `-o`: `out.bedgraph` → `out.bw`, or `out.bw` → `out.bedgraph`). Every contig in the BigWig must appear in the chromosome sizes file.
 
 ## Input and output
 
@@ -110,7 +156,22 @@ If no input file is given, Pebble runs in demo mode.
 
 Pebble builds a dense per-base coverage array for each contig from the input intervals, then applies the sliding trimmed mean.
 
-**Output** — 4-column BedGraph: `chrom start end smoothed_coverage`, where `start`/`end` span one step (`[window_start, window_start + step)`) and `smoothed_coverage` is a rounded integer.
+**Output**
+
+| Format | When | Notes |
+|--------|------|-------|
+| BedGraph | always (default stdout, or `-o file.bedgraph`) | 4 columns: `chrom start end smoothed_coverage` |
+| BigWig | with `--sizes` (smoothed), or `--no-smooth` (direct BedGraph conversion) | Requires `-o` and `-DPEBBLE_BIGWIG=ON` build |
+
+BedGraph intervals use `[window_start, window_start + step)` and `smoothed_coverage` is a rounded integer. BigWig carries the same intervals and values in binary form; the chromosome sizes file supplies the sequence lengths for the BigWig header (UCSC `chrom.sizes` format: one `name<TAB>length` per line, `#` comments allowed).
+
+**Chromosome sizes file** — tab- or space-separated, one sequence per line (see `examples/chrom.sizes`):
+
+```
+scaffold_1	418431624
+scaffold_10	135097871
+scaffold_176	7000
+```
 
 ## Library API
 
@@ -118,6 +179,7 @@ The core logic lives in `pebble_core`. The public headers are:
 
 - `include/pebble/pebble.h` — `pebble_process()` and configuration
 - `include/pebble/pebble_io.h` — BED/BedGraph read and write helpers
+- `include/pebble/pebble_bigwig.h` — BigWig output (when built with `PEBBLE_BIGWIG`)
 
 ```c
 #include "pebble/pebble.h"
@@ -142,12 +204,28 @@ Link against `pebble_core` and include the `include/` directory.
 
 ## Examples
 
-The `examples/` directory contains mock scaffold and genome2cov-style test data:
+Bundled data (`examples/`):
+
+```
+example_cov.bed   # genome2cov BED for scaffold_1
+chrom.sizes       # scaffold lengths for BigWig
+```
+
+Quick runs:
 
 ```bash
-make example   # runs pebble on examples/mock_scaffold.bedgraph
-./build/pebble -i examples/genome2cov_style.bed -W 50 -S 10 -o build/genome2cov.smoothed.bedgraph
+make example   # mock scaffold demo (small; see examples/mock_scaffold.bedgraph)
+
+# Real example coverage
+./build/pebble -i examples/example_cov.bed -o build/example_cov.smoothed.bedgraph
+
+# Smoothed BedGraph + BigWig (after cmake -DPEBBLE_BIGWIG=ON or make PEBBLE_BIGWIG=1)
+./build/pebble -i examples/example_cov.bed \
+  -o build/example_cov.smoothed.bedgraph \
+  --sizes examples/chrom.sizes
 ```
+
+Unit tests also use smaller fixtures (`examples/mock_scaffold.bedgraph`, `examples/genome2cov_style.bed`).
 
 ## Reference
 

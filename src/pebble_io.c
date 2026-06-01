@@ -444,6 +444,189 @@ void pebble_coverage_batch_free(pebble_coverage_batch_t *batch)
     batch->count = 0;
 }
 
+static int compare_coverage_chrom(const void *left, const void *right)
+{
+    const pebble_coverage_t *a = (const pebble_coverage_t *)left;
+    const pebble_coverage_t *b = (const pebble_coverage_t *)right;
+    int chrom_cmp = strcmp(a->chrom, b->chrom);
+
+    if (chrom_cmp != 0) {
+        return chrom_cmp;
+    }
+    if (a->start_offset < b->start_offset) {
+        return -1;
+    }
+    if (a->start_offset > b->start_offset) {
+        return 1;
+    }
+    return 0;
+}
+
+void pebble_coverage_batch_sort(pebble_coverage_batch_t *batch)
+{
+    if (batch == NULL || batch->items == NULL || batch->count <= 1U) {
+        return;
+    }
+
+    qsort(batch->items, batch->count, sizeof(pebble_coverage_t), compare_coverage_chrom);
+}
+
+static int compare_bedgraph_record(const void *left, const void *right)
+{
+    const pebble_bedgraph_record_t *a = (const pebble_bedgraph_record_t *)left;
+    const pebble_bedgraph_record_t *b = (const pebble_bedgraph_record_t *)right;
+    int chrom_cmp = strcmp(a->chrom, b->chrom);
+
+    if (chrom_cmp != 0) {
+        return chrom_cmp;
+    }
+    if (a->start < b->start) {
+        return -1;
+    }
+    if (a->start > b->start) {
+        return 1;
+    }
+    return 0;
+}
+
+void pebble_bedgraph_batch_free(pebble_bedgraph_batch_t *batch)
+{
+    size_t i;
+
+    if (batch == NULL) {
+        return;
+    }
+    if (batch->items != NULL) {
+        for (i = 0; i < batch->count; i++) {
+            free(batch->items[i].chrom);
+        }
+        free(batch->items);
+    }
+    batch->items = NULL;
+    batch->count = 0;
+}
+
+void pebble_bedgraph_batch_sort(pebble_bedgraph_batch_t *batch)
+{
+    if (batch == NULL || batch->items == NULL || batch->count <= 1U) {
+        return;
+    }
+
+    qsort(batch->items, batch->count, sizeof(pebble_bedgraph_record_t), compare_bedgraph_record);
+}
+
+pebble_io_status_t pebble_read_bedgraph_records(
+    const char *path,
+    const char *chrom_filter,
+    pebble_bedgraph_batch_t *out)
+{
+    FILE *input;
+    char line[4096];
+    size_t cap = 0;
+    pebble_io_status_t status = PEBBLE_IO_OK;
+
+    if (path == NULL || out == NULL) {
+        return PEBBLE_IO_ERR_INVALID_ARG;
+    }
+
+    out->items = NULL;
+    out->count = 0;
+
+    input = fopen(path, "r");
+    if (input == NULL) {
+        return PEBBLE_IO_ERR_IO;
+    }
+
+    while (fgets(line, sizeof(line), input) != NULL) {
+        char chrom[256];
+        int start = 0;
+        int end = 0;
+        double value = 0.0;
+        pebble_bedgraph_record_t *items;
+        char *chrom_copy;
+
+        if (is_header_line(line)) {
+            continue;
+        }
+
+        status = parse_interval_line(line, chrom, &start, &end, &value, 0);
+        if (status != PEBBLE_IO_OK) {
+            break;
+        }
+        if (end <= start) {
+            continue;
+        }
+        if (chrom_filter != NULL && strcmp(chrom, chrom_filter) != 0) {
+            continue;
+        }
+
+        if (out->count == cap) {
+            size_t new_cap = cap == 0U ? 64U : cap * 2U;
+            items = (pebble_bedgraph_record_t *)realloc(out->items, new_cap * sizeof(pebble_bedgraph_record_t));
+            if (items == NULL) {
+                status = PEBBLE_IO_ERR_OOM;
+                break;
+            }
+            out->items = items;
+            cap = new_cap;
+        }
+
+        chrom_copy = strdup(chrom);
+        if (chrom_copy == NULL) {
+            status = PEBBLE_IO_ERR_OOM;
+            break;
+        }
+
+        out->items[out->count].chrom = chrom_copy;
+        out->items[out->count].start = start;
+        out->items[out->count].end = end;
+        out->items[out->count].value = value;
+        out->count++;
+    }
+
+    if (ferror(input)) {
+        status = PEBBLE_IO_ERR_IO;
+    }
+    if (status == PEBBLE_IO_OK && out->count == 0U) {
+        status = PEBBLE_IO_ERR_PARSE;
+    }
+
+    fclose(input);
+    if (status != PEBBLE_IO_OK) {
+        pebble_bedgraph_batch_free(out);
+    }
+    return status;
+}
+
+pebble_io_status_t pebble_write_bedgraph_records(
+    FILE *out,
+    const pebble_bedgraph_record_t *records,
+    size_t count)
+{
+    size_t i;
+
+    if (out == NULL || records == NULL) {
+        return PEBBLE_IO_ERR_INVALID_ARG;
+    }
+
+    for (i = 0; i < count; i++) {
+        if (
+            fprintf(
+                out,
+                "%s\t%d\t%d\t%d\n",
+                records[i].chrom,
+                records[i].start,
+                records[i].end,
+                pebble_round_coverage(records[i].value)
+            ) < 0
+        ) {
+            return PEBBLE_IO_ERR_IO;
+        }
+    }
+
+    return PEBBLE_IO_OK;
+}
+
 pebble_io_status_t pebble_read_bedgraph(
     const char *path,
     const char *chrom_filter,

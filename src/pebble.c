@@ -1,24 +1,7 @@
 #include "pebble/pebble.h"
 
+#include <stdint.h>
 #include <stdlib.h>
-
-typedef struct {
-    const int16_t *values;
-} sort_ctx_t;
-
-static int compare_int16(const void *left, const void *right)
-{
-    int16_t a = *(const int16_t *)left;
-    int16_t b = *(const int16_t *)right;
-
-    if (a < b) {
-        return -1;
-    }
-    if (a > b) {
-        return 1;
-    }
-    return 0;
-}
 
 static int config_is_valid(const pebble_config_t *config)
 {
@@ -35,6 +18,66 @@ static int config_is_valid(const pebble_config_t *config)
         return 0;
     }
     return 1;
+}
+
+static void clear_counts(uint32_t *counts, int hist_max)
+{
+    for (int v = 0; v <= hist_max; v++) {
+        counts[v] = 0U;
+    }
+}
+
+static double trimmed_mean_window(
+    const int16_t *coverage,
+    size_t start,
+    int window_size,
+    int low_idx,
+    int high_idx,
+    uint32_t *counts,
+    int *hist_max)
+{
+    int wmax = 0;
+    int need_skip = low_idx;
+    int need_take = high_idx - low_idx;
+    int64_t sum = 0;
+
+    *hist_max = 0;
+
+    for (int k = 0; k < window_size; k++) {
+        int idx = (int)(uint16_t)coverage[start + (size_t)k];
+        counts[idx]++;
+        if (idx > wmax) {
+            wmax = idx;
+        }
+    }
+    *hist_max = wmax;
+
+    for (int v = 0; v <= wmax && need_take > 0; v++) {
+        uint32_t c = counts[v];
+        if (c == 0U) {
+            continue;
+        }
+
+        if (need_skip > 0) {
+            if ((int)c <= need_skip) {
+                need_skip -= (int)c;
+                continue;
+            }
+            {
+                int avail = (int)c - need_skip;
+                int take = avail < need_take ? avail : need_take;
+                need_skip = 0;
+                sum += (int64_t)v * take;
+                need_take -= take;
+            }
+        } else {
+            int take = (int)c < need_take ? (int)c : need_take;
+            sum += (int64_t)v * take;
+            need_take -= take;
+        }
+    }
+
+    return (double)sum / (double)(high_idx - low_idx);
 }
 
 size_t pebble_output_count(size_t coverage_len, const pebble_config_t *config)
@@ -61,7 +104,8 @@ pebble_status_t pebble_process(
     int low_idx;
     int high_idx;
     double trimmed_len;
-    int16_t *window_buf = NULL;
+    uint32_t *counts = NULL;
+    int hist_max = 0;
 
     if (coverage == NULL || config == NULL || out == NULL || out_len == NULL) {
         return PEBBLE_ERR_INVALID_ARG;
@@ -90,29 +134,27 @@ pebble_status_t pebble_process(
         return PEBBLE_ERR_INVALID_ARG;
     }
 
-    window_buf = (int16_t *)malloc((size_t)config->window_size * sizeof(int16_t));
-    if (window_buf == NULL) {
+    counts = (uint32_t *)calloc(65536U, sizeof(uint32_t));
+    if (counts == NULL) {
         return PEBBLE_ERR_INVALID_ARG;
     }
 
     for (size_t i = 0; i < num_steps; i++) {
         size_t start = i * (size_t)config->step_size;
-        int64_t sum = 0;
 
-        for (int k = 0; k < config->window_size; k++) {
-            window_buf[k] = coverage[start + (size_t)k];
-        }
-
-        qsort(window_buf, (size_t)config->window_size, sizeof(int16_t), compare_int16);
-
-        for (int k = low_idx; k < high_idx; k++) {
-            sum += (int64_t)window_buf[k];
-        }
-
-        out[i] = (double)sum / trimmed_len;
+        out[i] = trimmed_mean_window(
+            coverage,
+            start,
+            config->window_size,
+            low_idx,
+            high_idx,
+            counts,
+            &hist_max
+        );
+        clear_counts(counts, hist_max);
     }
 
-    free(window_buf);
+    free(counts);
     *out_len = num_steps;
     return PEBBLE_OK;
 }
