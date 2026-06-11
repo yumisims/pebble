@@ -55,6 +55,14 @@ void pebble_coverage_batch_sort(pebble_coverage_batch_t *batch);
 
 void pebble_bedgraph_batch_sort(pebble_bedgraph_batch_t *batch);
 
+pebble_io_status_t pebble_read_interval_records(
+    const char *path,
+    const char *chrom_filter,
+    int use_score_field,
+    pebble_bedgraph_batch_t *out);
+
+void pebble_bedgraph_batch_extend_to_zero(pebble_bedgraph_batch_t *batch);
+
 pebble_io_status_t pebble_read_bedgraph_records(
     const char *path,
     const char *chrom_filter,
@@ -118,6 +126,31 @@ void pebble_output_interval(
 );
 
 int pebble_round_coverage(double value);
+
+/*
+ * Add length-weighted smoothed coverage from one contig into genome totals.
+ * Genome average is weighted_sum / total_bases after all contigs are accumulated.
+ */
+void pebble_smoothed_genome_average_add(
+    int start_offset,
+    const pebble_config_t *config,
+    const double *values,
+    size_t value_count,
+    double *weighted_sum,
+    size_t *total_bases
+);
+
+/*
+ * normalise_factor = genome_average / 2 so the whole-genome mean becomes 2.
+ * Returns 1.0 when genome_average <= 0.
+ */
+double pebble_coverage_normalise_factor(double genome_average);
+
+void pebble_normalise_smoothed_values(
+    double *values,
+    size_t value_count,
+    double normalise_factor
+);
 
 const char *pebble_io_status_string(pebble_io_status_t status);
 

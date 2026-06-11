@@ -1,6 +1,6 @@
 # Pebble
 
-**Author:** Yumi Sims
+**Authors:** Yumi Sims, Jo Wood, Zemin Ning
 
 Pebble is a command-line tool and C library for smoothing genomic sequencing coverage tracks. It reads per-base coverage from BED or BedGraph files, applies a sliding trimmed mean, and writes the result as BedGraph or BigWig.
 
@@ -25,6 +25,55 @@ Example output coordinates for the first three steps on a contig starting at 0:
 | 2 | 200–1199 | 200–300 | mean of middle 200 in window |
 
 Contigs shorter than the window size are skipped. Smoothed values are **rounded to the nearest integer** in the output BedGraph.
+
+### Coverage normalisation
+
+After smoothing all contigs, Pebble computes a **length-weighted genome average** of the smoothed track, then writes a second **normalised** BedGraph:
+
+1. **Genome average** — weighted mean of smoothed coverage across all intervals (weighted by interval length).
+2. **Normalise factor** — `genome_average / 2`.
+3. **Normalised coverage** — `smoothed_coverage / normalise_factor`.
+
+The whole-genome mean of the normalised track is therefore **2.0**. This matches the diploid baseline used in stepStone-style CNV plots: autosomes at typical depth map to **~2**, not to 1.
+
+**Why divide by 2?** In a diploid genome, each autosome is present in two copies. Scaling so the genome-wide average equals **2** turns coverage into copy-number-like units:
+
+| Relative depth | Normalised value | Interpretation |
+|----------------|------------------|----------------|
+| Typical autosomal | ~2 | Diploid |
+| Half autosomal depth | ~1 | One copy |
+| Absent / unmapped | ~0 | No copy |
+
+This makes broad deviations from 2 easy to see on a plot without converting raw read depth mentally.
+
+**Sex chromosome identification.** Because the normalise factor is driven mostly by autosomes (diploid, ~2 after scaling), sex chromosomes stand out when their true copy number differs:
+
+| Karyotype | Autosomes | X | Y |
+|-----------|-----------|---|---|
+| XY (male) | ~2 | ~1 | ~1 |
+| XX (female) | ~2 | ~2 | ~0 |
+
+On a normalised track, an X contig sitting near **1** while autosomes sit near **2** suggests XY; X near **2** with Y near **0** suggests XX. This is a visual screen, not a formal karyotype call — PAR regions, aneuploidy, or misassembly can affect the pattern — but it is the same rationale stepStone uses for denoised coverage plots.
+
+Pebble logs the genome average and normalise factor to stderr, for example:
+
+```
+pebble: genome average=54.24, normalise factor=27.1180 (avg/2), target mean=2.0
+```
+
+**Output files.** When `-o` is given, Pebble writes **both** tracks:
+
+| File | Contents |
+|------|----------|
+| `*.smoothed.bedgraph` | Raw smoothed coverage |
+| `*.normalised.bedgraph` (or the `-o` path if it is not already `*.smoothed.bedgraph`) | Normalised coverage |
+
+Path rules:
+
+- `-o out.bedgraph` → `out.smoothed.bedgraph` + `out.bedgraph` (normalised)
+- `-o sample.smoothed.bedgraph` → `sample.smoothed.bedgraph` + `sample.normalised.bedgraph`
+
+BigWig (with `--sizes`) is built from the **normalised** BedGraph. Demo mode (`--demo`) prints both smoothed and normalised columns to stdout.
 
 ## Build
 
@@ -93,15 +142,16 @@ Example data in `examples/`:
 
 # Smooth example coverage (genome2cov-style BED)
 ./build/pebble -i examples/example_cov.bed -o build/example_cov.smoothed.bedgraph
+# -> build/example_cov.smoothed.bedgraph + build/example_cov.normalised.bedgraph
 
 # Single contig (example_cov.bed contains scaffold_1 only)
 ./build/pebble -i examples/example_cov.bed -c scaffold_1 -o build/scaffold_1.smoothed.bedgraph
 
-# Smoothed BedGraph + BigWig (requires -DPEBBLE_BIGWIG=ON build)
+# Normalised BedGraph + BigWig (requires -DPEBBLE_BIGWIG=ON build)
 ./build/pebble -i examples/example_cov.bed \
   -o build/example_cov.smoothed.bedgraph \
   --sizes examples/chrom.sizes
-# -> build/example_cov.smoothed.bedgraph + build/example_cov.smoothed.bw
+# -> build/example_cov.smoothed.bedgraph + build/example_cov.normalised.bedgraph + build/example_cov.smoothed.bw
 
 # BedGraph to BigWig without smoothing (pass-through; input must be .bedgraph)
 ./build/pebble -i raw.bedgraph \
@@ -123,14 +173,30 @@ Other input types:
 ./build/pebble -i examples/genome2cov_style.bed -W 50 -S 10 -o smoothed.bedgraph
 ```
 
+### Coverage plots (stepStone style)
+
+Pebble smoothing matches [stepStone](https://github.com/wtsi-hpag/stepStone) `plot -denoise 1` (1000 bp window, mean of middle 20% after trimming). `--stepstone` uses stepStone line style (black, linewidth 3, ymin 1, ~9000 display points); Y max scales from data (stepStone’s default `-hight 180` is for shallow cancer WGS — use `--ymax 180` only when depth stays below that):
+
+```bash
+# Smooth + plot one contig (plots the normalised track)
+scripts/pebble_plot.sh examples/example_cov.bed scaffold_1 mysample ./plots
+# -> ./plots/mysample.smoothed.bedgraph, ./plots/mysample.normalised.bedgraph, ./plots/mysample_scaffold_1.png
+
+# Plot an existing normalised BedGraph
+python3 scripts/plot_bedgraph.py build/example_cov.normalised.bedgraph \
+  -c scaffold_1 -s mysample -o plot.png --stepstone
+```
+
+For deep coverage (e.g. peaks ~800), rely on auto ymax or set explicitly: `--ymax 900`.
+
 ### Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-i input` | Input BED or BedGraph file | — |
-| `-o output` | BedGraph output file | stdout |
+| `-o output` | Normalised BedGraph path; also writes companion `*.smoothed.bedgraph` | stdout (normalised only) |
 | `--sizes file` | Chromosome sizes (`name<TAB>length`); also writes a `.bw` alongside BedGraph | — |
-| `--no-smooth` | Convert BedGraph to BigWig without smoothing (requires BedGraph input, `--sizes`, `-o`) | off |
+| `--no-smooth` | Convert coverage BED/BedGraph to BigWig without smoothing (requires `--sizes`, `-o`) | off |
 | `--format-out bedgraph\|bigwig` | With `--sizes`, treat `-o` as BigWig basename when set to `bigwig` | BedGraph always; BigWig when `--sizes` given |
 | `-c chrom` | Process only the named chromosome or contig | all |
 | `-f bed\|bedgraph` | Input format | inferred from extension |
@@ -142,7 +208,13 @@ Other input types:
 
 If no input file is given, Pebble runs in demo mode.
 
-BigWig output uses [libBigWig](https://github.com/dpryan79/libBigWig). Enable it at build time with `-DPEBBLE_BIGWIG=ON` (CMake) or `make PEBBLE_BIGWIG=1`. **BedGraph is always written.** When `--sizes` is given, a BigWig file is also written (derived from `-o`: `out.bedgraph` → `out.bw`, or `out.bw` → `out.bedgraph`). Every contig in the BigWig must appear in the chromosome sizes file.
+BigWig output uses [libBigWig](https://github.com/dpryan79/libBigWig). Enable it at build time with `-DPEBBLE_BIGWIG=ON` (CMake) or `make PEBBLE_BIGWIG=1`. **BedGraph is always written** (smoothed and normalised when `-o` is a file). When `--sizes` is given, Pebble also writes a `.bw` file from the **normalised** BedGraph (same intervals as UCSC `bedGraphToBigWig`). Every contig in the BigWig must appear in the chromosome sizes file.
+
+You can also convert an existing BedGraph with UCSC tools if you prefer:
+
+```bash
+bedGraphToBigWig smoothed.bedgraph chrom.sizes smoothed.bw
+```
 
 ## Input and output
 
@@ -154,16 +226,17 @@ BigWig output uses [libBigWig](https://github.com/dpryan79/libBigWig). Enable it
 | genome2cov BED | `chrom start end coverage` | 4-column; inferred from `.bed` extension |
 | BED | `chrom start end name score …` | Score taken from column 5; use `-f bed` |
 
-Pebble builds a dense per-base coverage array for each contig from the input intervals, then applies the sliding trimmed mean.
+Pebble builds a dense per-base coverage array for each contig from the input intervals (anchored at coordinate 0), fills gaps between intervals with the previous coverage value, and extends from base 0 up to the first interval with that interval’s value. Then it applies the sliding trimmed mean.
 
 **Output**
 
 | Format | When | Notes |
 |--------|------|-------|
-| BedGraph | always (default stdout, or `-o file.bedgraph`) | 4 columns: `chrom start end smoothed_coverage` |
-| BigWig | with `--sizes` (smoothed), or `--no-smooth` (direct BedGraph conversion) | Requires `-o` and `-DPEBBLE_BIGWIG=ON` build |
+| BedGraph (smoothed) | `-o` path given | 4 columns: `chrom start end smoothed_coverage` |
+| BedGraph (normalised) | `-o` path given, or stdout if no `-o` | 4 columns: `chrom start end normalised_coverage`; genome-wide mean ≈ 2 |
+| BigWig | with `--sizes` (from normalised BedGraph), or `--no-smooth` (direct BedGraph conversion) | Requires `-o` and `-DPEBBLE_BIGWIG=ON` build |
 
-BedGraph intervals use `[window_start, window_start + step)` and `smoothed_coverage` is a rounded integer. BigWig carries the same intervals and values in binary form; the chromosome sizes file supplies the sequence lengths for the BigWig header (UCSC `chrom.sizes` format: one `name<TAB>length` per line, `#` comments allowed).
+BedGraph intervals use `[window_start, window_start + step)` and coverage values are rounded integers. BigWig carries the same intervals and values in binary form; the chromosome sizes file supplies the sequence lengths for the BigWig header (UCSC `chrom.sizes` format: one `name<TAB>length` per line, `#` comments allowed).
 
 **Chromosome sizes file** — tab- or space-separated, one sequence per line (see `examples/chrom.sizes`):
 
@@ -219,10 +292,11 @@ make example   # mock scaffold demo (small; see examples/mock_scaffold.bedgraph)
 # Real example coverage
 ./build/pebble -i examples/example_cov.bed -o build/example_cov.smoothed.bedgraph
 
-# Smoothed BedGraph + BigWig (after cmake -DPEBBLE_BIGWIG=ON or make PEBBLE_BIGWIG=1)
+# Normalised BedGraph + BigWig (after cmake -DPEBBLE_BIGWIG=ON or make PEBBLE_BIGWIG=1)
 ./build/pebble -i examples/example_cov.bed \
   -o build/example_cov.smoothed.bedgraph \
   --sizes examples/chrom.sizes
+# -> build/example_cov.smoothed.bedgraph, build/example_cov.normalised.bedgraph, build/example_cov.smoothed.bw
 ```
 
 Unit tests also use smaller fixtures (`examples/mock_scaffold.bedgraph`, `examples/genome2cov_style.bed`).

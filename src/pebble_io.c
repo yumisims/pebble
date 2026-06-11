@@ -234,20 +234,19 @@ static pebble_io_status_t build_batch_from_extents(
     out->count = extents->count;
 
     for (size_t i = 0; i < extents->count; i++) {
-        int span = extents->items[i].max_end - extents->items[i].min_start;
         size_t length;
 
-        if (span <= 0) {
+        if (extents->items[i].max_end <= 0) {
             pebble_coverage_batch_free(out);
             return PEBBLE_IO_ERR_PARSE;
         }
-        if ((size_t)span > SIZE_MAX / sizeof(int16_t)) {
+        if ((size_t)extents->items[i].max_end > SIZE_MAX / sizeof(int16_t)) {
             pebble_coverage_batch_free(out);
             return PEBBLE_IO_ERR_OOM;
         }
-        length = (size_t)span;
+        length = (size_t)extents->items[i].max_end;
         out->items[i].chrom = strdup(extents->items[i].chrom);
-        out->items[i].start_offset = extents->items[i].min_start;
+        out->items[i].start_offset = 0;
         out->items[i].length = length;
         out->items[i].coverage = (int16_t *)calloc(length, sizeof(int16_t));
         if (out->items[i].chrom == NULL || out->items[i].coverage == NULL) {
@@ -277,9 +276,22 @@ static pebble_io_status_t fill_batch_from_file(
 {
     FILE *input = fopen(path, "r");
     char line[4096];
+    int *prev_end = NULL;
+    int16_t *prev_value = NULL;
 
     if (input == NULL) {
         return PEBBLE_IO_ERR_IO;
+    }
+
+    if (batch->count > 0U) {
+        prev_end = (int *)calloc(batch->count, sizeof(int));
+        prev_value = (int16_t *)calloc(batch->count, sizeof(int16_t));
+        if (prev_end == NULL || prev_value == NULL) {
+            free(prev_end);
+            free(prev_value);
+            fclose(input);
+            return PEBBLE_IO_ERR_OOM;
+        }
     }
 
     while (fgets(line, sizeof(line), input) != NULL) {
@@ -303,6 +315,8 @@ static pebble_io_status_t fill_batch_from_file(
             use_score_field
         );
         if (parse_status != PEBBLE_IO_OK) {
+            free(prev_end);
+            free(prev_value);
             fclose(input);
             return parse_status;
         }
@@ -321,20 +335,38 @@ static pebble_io_status_t fill_batch_from_file(
         {
             pebble_coverage_t *entry = &batch->items[(size_t)chrom_idx];
             int16_t clipped = clamp_to_int16(value);
-            int local_start = start - entry->start_offset;
-            int local_end = end - entry->start_offset;
+            int local_start = start;
+            int local_end = end;
+            int16_t gap_fill;
+            int i;
 
-            if (local_start < 0) {
-                local_start = 0;
-            }
             if (local_end > (int)entry->length) {
                 local_end = (int)entry->length;
             }
-            for (int i = local_start; i < local_end; i++) {
+            if (local_start < 0) {
+                local_start = 0;
+            }
+
+            if (start > prev_end[chrom_idx]) {
+                gap_fill = (prev_end[chrom_idx] == 0) ? clipped : prev_value[chrom_idx];
+                for (i = prev_end[chrom_idx]; i < start && i < (int)entry->length; i++) {
+                    entry->coverage[(size_t)i] = gap_fill;
+                }
+            }
+
+            for (i = local_start; i < local_end; i++) {
                 entry->coverage[(size_t)i] = clipped;
             }
+
+            if (end > prev_end[chrom_idx]) {
+                prev_end[chrom_idx] = end;
+            }
+            prev_value[chrom_idx] = clipped;
         }
     }
+
+    free(prev_end);
+    free(prev_value);
 
     if (ferror(input)) {
         fclose(input);
@@ -515,9 +547,10 @@ void pebble_bedgraph_batch_sort(pebble_bedgraph_batch_t *batch)
     qsort(batch->items, batch->count, sizeof(pebble_bedgraph_record_t), compare_bedgraph_record);
 }
 
-pebble_io_status_t pebble_read_bedgraph_records(
+pebble_io_status_t pebble_read_interval_records(
     const char *path,
     const char *chrom_filter,
+    int use_score_field,
     pebble_bedgraph_batch_t *out)
 {
     FILE *input;
@@ -549,7 +582,7 @@ pebble_io_status_t pebble_read_bedgraph_records(
             continue;
         }
 
-        status = parse_interval_line(line, chrom, &start, &end, &value, 0);
+        status = parse_interval_line(line, chrom, &start, &end, &value, use_score_field);
         if (status != PEBBLE_IO_OK) {
             break;
         }
@@ -596,6 +629,35 @@ pebble_io_status_t pebble_read_bedgraph_records(
         pebble_bedgraph_batch_free(out);
     }
     return status;
+}
+
+void pebble_bedgraph_batch_extend_to_zero(pebble_bedgraph_batch_t *batch)
+{
+    size_t i = 0;
+
+    if (batch == NULL || batch->items == NULL) {
+        return;
+    }
+
+    while (i < batch->count) {
+        size_t j = i + 1U;
+
+        while (j < batch->count && strcmp(batch->items[j].chrom, batch->items[i].chrom) == 0) {
+            j++;
+        }
+        if (batch->items[i].start > 0) {
+            batch->items[i].start = 0;
+        }
+        i = j;
+    }
+}
+
+pebble_io_status_t pebble_read_bedgraph_records(
+    const char *path,
+    const char *chrom_filter,
+    pebble_bedgraph_batch_t *out)
+{
+    return pebble_read_interval_records(path, chrom_filter, 0, out);
 }
 
 pebble_io_status_t pebble_write_bedgraph_records(
@@ -688,6 +750,60 @@ static int round_coverage(double value)
 int pebble_round_coverage(double value)
 {
     return round_coverage(value);
+}
+
+void pebble_smoothed_genome_average_add(
+    int start_offset,
+    const pebble_config_t *config,
+    const double *values,
+    size_t value_count,
+    double *weighted_sum,
+    size_t *total_bases)
+{
+    size_t idx;
+
+    if (config == NULL || values == NULL || weighted_sum == NULL || total_bases == NULL) {
+        return;
+    }
+
+    for (idx = 0; idx < value_count; idx++) {
+        int start = 0;
+        int end = 0;
+        size_t span;
+
+        pebble_output_interval(idx, start_offset, config, &start, &end);
+        span = (size_t)(end - start);
+        if (span == 0U) {
+            continue;
+        }
+
+        *weighted_sum += values[idx] * (double)span;
+        *total_bases += span;
+    }
+}
+
+double pebble_coverage_normalise_factor(double genome_average)
+{
+    if (genome_average <= 0.0) {
+        return 1.0;
+    }
+    return genome_average / 2.0;
+}
+
+void pebble_normalise_smoothed_values(
+    double *values,
+    size_t value_count,
+    double normalise_factor)
+{
+    size_t idx;
+
+    if (values == NULL || normalise_factor <= 0.0) {
+        return;
+    }
+
+    for (idx = 0; idx < value_count; idx++) {
+        values[idx] /= normalise_factor;
+    }
 }
 
 pebble_io_status_t pebble_write_bedgraph(

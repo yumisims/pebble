@@ -7,7 +7,7 @@ Writes PNG when matplotlib is available, otherwise SVG (stdlib only).
 Examples:
   ./build/pebble -i genome2cov.bed -c scaffold_1 -o smoothed.bedgraph
   python3 scripts/plot_bedgraph.py smoothed.bedgraph -c scaffold_1 -o plot.png
-  python3 scripts/plot_bedgraph.py smoothed.bedgraph -c scaffold_1 -o plot.svg --format svg
+  python3 scripts/plot_bedgraph.py smoothed.bedgraph -c chr1 -s sample -o plot.png --stepstone
 """
 
 from __future__ import annotations
@@ -30,23 +30,80 @@ except ImportError:
     pass
 
 
-def read_bedgraph(path: Path) -> dict[str, list[tuple[int, int, float]]]:
-    tracks: dict[str, list[tuple[int, int, float]]] = defaultdict(list)
+def parse_bedgraph_line(
+    path: Path, line_no: int, raw: str
+) -> tuple[str, int, int, float] | None:
+    line = raw.strip()
+    if not line or line.startswith("#") or line.startswith("track"):
+        return None
 
+    parts = [field.strip("\r") for field in line.split()]
+    if len(parts) < 4:
+        raise ValueError(f"{path}:{line_no}: expected 4 columns, got {len(parts)}")
+
+    return parts[0], int(parts[1]), int(parts[2]), float(parts[3])
+
+
+def first_bedgraph_chrom(path: Path) -> str | None:
     with path.open("r", encoding="utf-8") as handle:
         for line_no, raw in enumerate(handle, start=1):
+            parsed = parse_bedgraph_line(path, line_no, raw)
+            if parsed is not None:
+                return parsed[0]
+    return None
+
+
+def list_bedgraph_chroms(path: Path, max_names: int = 200) -> list[str]:
+    """List contig names in file order (one pass, column 1 only)."""
+    seen: list[str] = []
+    prev: str | None = None
+
+    with path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
             line = raw.strip()
             if not line or line.startswith("#") or line.startswith("track"):
                 continue
+            chrom = line.split(None, 1)[0].strip("\r")
+            if chrom == prev:
+                continue
+            prev = chrom
+            seen.append(chrom)
+            if len(seen) >= max_names:
+                break
 
-            parts = line.split()
-            if len(parts) < 4:
-                raise ValueError(f"{path}:{line_no}: expected 4 columns, got {len(parts)}")
+    return seen
 
-            chrom = parts[0]
-            start = int(parts[1])
-            end = int(parts[2])
-            value = float(parts[3])
+
+def read_bedgraph(
+    path: Path, chrom_filter: set[str] | None = None
+) -> dict[str, list[tuple[int, int, float]]]:
+    tracks: dict[str, list[tuple[int, int, float]]] = defaultdict(list)
+    single_target = (
+        next(iter(chrom_filter)) if chrom_filter is not None and len(chrom_filter) == 1 else None
+    )
+    in_target_block = False
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, raw in enumerate(handle, start=1):
+            parsed = parse_bedgraph_line(path, line_no, raw)
+            if parsed is None:
+                continue
+
+            chrom, start, end, value = parsed
+            if single_target is not None:
+                if chrom == single_target:
+                    in_target_block = True
+                    tracks[chrom].append((start, end, value))
+                    continue
+                if in_target_block:
+                    break
+                if chrom > single_target:
+                    break
+                continue
+
+            if chrom_filter is not None and chrom not in chrom_filter:
+                continue
+
             tracks[chrom].append((start, end, value))
 
     for chrom in tracks:
@@ -71,6 +128,16 @@ def bedgraph_to_xy(intervals: list[tuple[int, int, float]]) -> tuple[list[int], 
     return xs, ys, xmax
 
 
+def subsample_xy(
+    xs: list[int], ys: list[float], max_points: int
+) -> tuple[list[int], list[float]]:
+    """Reduce point count for display (stepStone keeps ~9000 points per chr)."""
+    if max_points <= 0 or len(xs) <= max_points:
+        return xs, ys
+    stride = max(1, (len(xs) + max_points - 1) // max_points)
+    return xs[::stride], ys[::stride]
+
+
 def resolve_ymax(values: Iterable[float], ymax_arg: str) -> float:
     vals = list(values)
     if not vals:
@@ -91,21 +158,27 @@ def plot_track_png(
     *,
     sample: str,
     ymax: float,
+    ymin: float,
     width: float,
     height: float,
+    linewidth: float,
+    stepstone_style: bool,
     output: Path,
 ) -> None:
     fig, ax = plt.subplots(figsize=(width, height))
-    ax.plot(xs, ys, color="black", linewidth=1.2)
+    ax.plot(xs, ys, color="black", linewidth=linewidth)
     ax.set_xlabel("Chromosome coordinate")
     ax.set_ylabel("Base coverage")
-    ax.set_title(f"{sample} — {chrom}")
-    ax.set_ylim(0, ymax)
+    title = f"{sample} {chrom}" if stepstone_style else f"{sample} — {chrom}"
+    ax.set_title(title)
+    ax.set_ylim(ymin, ymax)
     ax.set_xlim(xs[0], xmax)
-    ax.grid(True, alpha=0.25, linewidth=0.5)
+    if not stepstone_style:
+        ax.grid(True, alpha=0.25, linewidth=0.5)
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=150)
+    dpi = 200 if stepstone_style else 150
+    fig.savefig(output, dpi=dpi)
     plt.close(fig)
 
 
@@ -117,8 +190,11 @@ def plot_track_svg(
     *,
     sample: str,
     ymax: float,
+    ymin: float,
     width: int,
     height: int,
+    linewidth: float,
+    stepstone_style: bool,
     output: Path,
 ) -> None:
     margin_left = 70
@@ -134,10 +210,14 @@ def plot_track_svg(
     def x_px(x: int) -> float:
         return margin_left + (x - xmin) * plot_w / xspan
 
-    def y_px(y: float) -> float:
-        clipped = min(max(y, 0.0), ymax)
-        return margin_top + plot_h - (clipped * plot_h / ymax)
+    yspan = max(1e-9, ymax - ymin)
 
+    def y_px(y: float) -> float:
+        clipped = min(max(y, ymin), ymax)
+        return margin_top + plot_h - ((clipped - ymin) * plot_h / yspan)
+
+    stroke_w = linewidth
+    title = f"{sample} {chrom}" if stepstone_style else f"{sample} — {chrom}"
     points = " ".join(f"{x_px(x):.1f},{y_px(y):.1f}" for x, y in zip(xs, ys))
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -149,7 +229,7 @@ def plot_track_svg(
         out.write(f'  <rect width="100%" height="100%" fill="white"/>\n')
         out.write(
             f'  <text x="{margin_left}" y="24" font-size="14" '
-            f'font-family="sans-serif">{sample} — {chrom}</text>\n'
+            f'font-family="sans-serif">{title}</text>\n'
         )
         out.write(
             f'  <line x1="{margin_left}" y1="{margin_top + plot_h}" '
@@ -160,7 +240,8 @@ def plot_track_svg(
             f'x2="{margin_left}" y2="{margin_top + plot_h}" stroke="#333"/>\n'
         )
         out.write(
-            f'  <polyline fill="none" stroke="black" stroke-width="1.5" points="{points}"/>\n'
+            f'  <polyline fill="none" stroke="black" stroke-width="{stroke_w}" '
+            f'points="{points}"/>\n'
         )
         out.write(
             f'  <text x="{margin_left + plot_w / 2:.0f}" y="{height - 12}" '
@@ -175,7 +256,7 @@ def plot_track_svg(
         )
         out.write(
             f'  <text x="{margin_left - 8}" y="{margin_top + plot_h + 4}" '
-            f'text-anchor="end" font-size="10" font-family="sans-serif">0</text>\n'
+            f'text-anchor="end" font-size="10" font-family="sans-serif">{ymin:.0f}</text>\n'
         )
         out.write(
             f'  <text x="{margin_left - 8}" y="{margin_top + 4}" '
@@ -190,8 +271,12 @@ def plot_track(
     *,
     sample: str,
     ymax: float,
+    ymin: float,
     width: float,
     height: float,
+    linewidth: float,
+    max_points: int,
+    stepstone_style: bool,
     output: Path,
     fmt: str,
 ) -> bool:
@@ -199,6 +284,9 @@ def plot_track(
     if not xs:
         print(f"pebble-plot: skipping empty track {chrom}", file=sys.stderr)
         return False
+
+    n_raw = len(xs)
+    xs, ys = subsample_xy(xs, ys, max_points)
 
     use_svg = fmt == "svg" or (fmt == "auto" and not HAS_MPL)
     if use_svg:
@@ -211,8 +299,11 @@ def plot_track(
             xmax,
             sample=sample,
             ymax=ymax,
+            ymin=ymin,
             width=int(width * 80),
             height=int(height * 80),
+            linewidth=linewidth,
+            stepstone_style=stepstone_style,
             output=output,
         )
     else:
@@ -225,12 +316,18 @@ def plot_track(
             xmax,
             sample=sample,
             ymax=ymax,
+            ymin=ymin,
             width=width,
             height=height,
+            linewidth=linewidth,
+            stepstone_style=stepstone_style,
             output=output,
         )
 
-    print(f"wrote {output} ({len(xs)} points, ymax={ymax:.1f})")
+    extra = f", subsampled {n_raw}->{len(xs)}" if len(xs) != n_raw else ""
+    print(
+        f"wrote {output} ({len(xs)} points, y=[{ymin:.0f},{ymax:.0f}]{extra})"
+    )
     return True
 
 
@@ -262,7 +359,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ymax",
         default="auto",
-        help="Y-axis max, or 'auto' from data (default: auto). Use 180 for stepStone style.",
+        help="Y-axis max, or 'auto' from data (default: auto)",
+    )
+    parser.add_argument(
+        "--ymin",
+        type=float,
+        default=None,
+        help="Y-axis min (default: 1 with --stepstone, else 0)",
+    )
+    parser.add_argument(
+        "--stepstone",
+        action="store_true",
+        help=(
+            "Match stepStone plot style (denoise 1): ymin=1, black lw=3, "
+            "no grid, subsample to ~9000 points; ymax auto unless --ymax set"
+        ),
+    )
+    parser.add_argument(
+        "--max-points",
+        type=int,
+        default=None,
+        help="Max points to draw (default: 9000 with --stepstone, else all)",
+    )
+    parser.add_argument(
+        "--linewidth",
+        type=float,
+        default=None,
+        help="Line width (default: 3 with --stepstone, else 1.2)",
     )
     parser.add_argument(
         "--format",
@@ -290,8 +413,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def apply_style_defaults(args: argparse.Namespace) -> None:
+    if args.stepstone:
+        if args.ymin is None:
+            args.ymin = 1.0
+        if args.max_points is None:
+            args.max_points = 9000
+        if args.linewidth is None:
+            args.linewidth = 3.0
+        if args.format == "auto" and HAS_MPL:
+            args.format = "png"
+    if args.ymin is None:
+        args.ymin = 0.0
+    if args.max_points is None:
+        args.max_points = 0
+    if args.linewidth is None:
+        args.linewidth = 1.2
+
+
 def main() -> int:
     args = parse_args()
+    apply_style_defaults(args)
 
     if not args.bedgraph.is_file():
         print(f"pebble-plot: file not found: {args.bedgraph}", file=sys.stderr)
@@ -306,20 +448,37 @@ def main() -> int:
         )
         return 1
 
+    chrom_filter: set[str] | None = None
+    if args.chroms and not args.list_chroms:
+        chrom_filter = set(args.chroms)
+
     try:
-        tracks = read_bedgraph(args.bedgraph)
+        tracks = read_bedgraph(args.bedgraph, chrom_filter)
     except ValueError as exc:
         print(f"pebble-plot: {exc}", file=sys.stderr)
         return 1
 
-    if not tracks:
-        print(f"pebble-plot: no data rows in {args.bedgraph}", file=sys.stderr)
-        return 1
-
     if args.list_chroms:
-        for chrom in sorted(tracks):
+        for chrom in list_bedgraph_chroms(args.bedgraph):
             print(chrom)
         return 0
+
+    if not tracks:
+        if chrom_filter:
+            first = first_bedgraph_chrom(args.bedgraph)
+            hint = f"  First contig in file: {first}\n" if first else ""
+            print(
+                f"pebble-plot: no rows for contig(s): {', '.join(sorted(chrom_filter))}\n"
+                f"  in {args.bedgraph}\n"
+                f"{hint}"
+                f"  Check the name matches exactly (e.g. scaffold_1 not scaffold1).\n"
+                f"  List all contigs: python3 scripts/plot_bedgraph.py "
+                f"{args.bedgraph} --list-chroms -o /tmp/x.png",
+                file=sys.stderr,
+            )
+        else:
+            print(f"pebble-plot: no data rows in {args.bedgraph}", file=sys.stderr)
+        return 1
 
     if args.format == "png" and not HAS_MPL:
         print(
@@ -354,8 +513,12 @@ def main() -> int:
             intervals,
             sample=args.sample,
             ymax=ymax,
+            ymin=args.ymin,
             width=args.width,
             height=args.height,
+            linewidth=args.linewidth,
+            max_points=args.max_points,
+            stepstone_style=args.stepstone,
             output=out,
             fmt=args.format,
         ):
@@ -379,8 +542,12 @@ def main() -> int:
                 intervals,
                 sample=args.sample,
                 ymax=ymax,
+                ymin=args.ymin,
                 width=args.width,
                 height=args.height,
+                linewidth=args.linewidth,
+                max_points=args.max_points,
+                stepstone_style=args.stepstone,
                 output=out_dir / f"{args.sample}_{safe}{ext}",
                 fmt=args.format,
             ):

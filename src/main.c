@@ -71,6 +71,48 @@ static char *derive_bedgraph_path(const char *output_path)
     return strdup(output_path);
 }
 
+static char *derive_smoothed_bedgraph_path(const char *output_path)
+{
+    if (output_path == NULL) {
+        return NULL;
+    }
+    if (path_ends_with(output_path, ".smoothed.bedgraph")) {
+        return strdup(output_path);
+    }
+    if (path_ends_with(output_path, ".normalised.bedgraph")) {
+        return replace_path_suffix(output_path, ".normalised.bedgraph", ".smoothed.bedgraph");
+    }
+    if (path_ends_with(output_path, ".bedgraph")) {
+        return replace_path_suffix(output_path, ".bedgraph", ".smoothed.bedgraph");
+    }
+    if (path_ends_with(output_path, ".bw") || path_ends_with(output_path, ".bigwig")) {
+        char *bedgraph = derive_bedgraph_path(output_path);
+        char *smoothed;
+
+        if (bedgraph == NULL) {
+            return NULL;
+        }
+        smoothed = replace_path_suffix(bedgraph, ".bedgraph", ".smoothed.bedgraph");
+        free(bedgraph);
+        return smoothed;
+    }
+    return NULL;
+}
+
+static char *derive_normalised_bedgraph_path(const char *output_path)
+{
+    if (output_path == NULL) {
+        return NULL;
+    }
+    if (path_ends_with(output_path, ".normalised.bedgraph")) {
+        return strdup(output_path);
+    }
+    if (path_ends_with(output_path, ".smoothed.bedgraph")) {
+        return replace_path_suffix(output_path, ".smoothed.bedgraph", ".normalised.bedgraph");
+    }
+    return derive_bedgraph_path(output_path);
+}
+
 static char *derive_bigwig_path(const char *output_path)
 {
     char *out;
@@ -106,7 +148,7 @@ static void print_usage(const char *program)
         "  -i input           Input BED or BedGraph file\n"
         "  -o output          Output BedGraph file (default: stdout)\n"
         "  --sizes file      Chromosome sizes (name<TAB>length); also writes BigWig\n"
-        "  --no-smooth       Convert BedGraph to BigWig without smoothing (needs --sizes, -o)\n"
+        "  --no-smooth       Convert coverage to BigWig without smoothing (needs --sizes, -o)\n"
         "  --format-out fmt  With --sizes: force BigWig basename (default: from -o)\n"
         "                    BigWig requires a build with -DPEBBLE_BIGWIG=ON\n"
         "  -c chrom           Process only the named chromosome or contig\n"
@@ -318,9 +360,6 @@ static int parse_options(int argc, char **argv, cli_options_t *options)
 
     if (options->no_smooth) {
         options->want_bigwig = 1;
-        if (options->format != PEBBLE_FORMAT_BEDGRAPH) {
-            return -1;
-        }
     }
 
     if (options->want_bigwig && options->output_path == NULL) {
@@ -387,30 +426,90 @@ static int run_demo(const pebble_config_t *config)
         return EXIT_FAILURE;
     }
 
-    printf("Interval_Start\tInterval_End\tSmoothed_Value\n");
-    for (size_t idx = 0; idx < out_len; idx++) {
-        int start = 0;
-        int end = 0;
+    {
+        double weighted_sum = 0.0;
+        size_t total_bases = 0;
+        double genome_average = 0.0;
+        double normalise_factor = 1.0;
 
-        pebble_output_interval(idx, 0, config, &start, &end);
-        printf("%d\t%d\t%d\n", start, end, pebble_round_coverage(smoothed_track[idx]));
+        pebble_smoothed_genome_average_add(0, config, smoothed_track, out_len, &weighted_sum, &total_bases);
+        if (total_bases > 0U) {
+            genome_average = weighted_sum / (double)total_bases;
+            normalise_factor = pebble_coverage_normalise_factor(genome_average);
+            fprintf(
+                stderr,
+                "pebble: genome average=%.2f, normalise factor=%.4f (avg/2), target mean=2.0\n",
+                genome_average,
+                normalise_factor
+            );
+        }
+
+        printf("Interval_Start\tInterval_End\tSmoothed\tNormalised\n");
+        for (size_t idx = 0; idx < out_len; idx++) {
+            int start = 0;
+            int end = 0;
+            double smoothed_value = smoothed_track[idx];
+            double normalised_value = smoothed_value / normalise_factor;
+
+            pebble_output_interval(idx, 0, config, &start, &end);
+            printf(
+                "%d\t%d\t%d\t%d\n",
+                start,
+                end,
+                pebble_round_coverage(smoothed_value),
+                pebble_round_coverage(normalised_value)
+            );
+        }
     }
 
     free(smoothed_track);
     return EXIT_SUCCESS;
 }
 
+typedef struct {
+    const pebble_coverage_t *entry;
+    double *values;
+    size_t value_count;
+} smoothed_contig_t;
+
+static void free_smoothed_contigs(smoothed_contig_t *contigs, size_t count)
+{
+    size_t i;
+
+    if (contigs == NULL) {
+        return;
+    }
+
+    for (i = 0; i < count; i++) {
+        free(contigs[i].values);
+    }
+    free(contigs);
+}
+
 static int process_batch(
     const pebble_coverage_batch_t *batch,
     const cli_options_t *options,
-    FILE *bedgraph_output,
-    pebble_bigwig_writer_t *bigwig_writer,
+    FILE *smoothed_output,
+    FILE *normalised_output,
     const pebble_chrom_sizes_t *chrom_sizes,
+    int validate_chrom_sizes,
     size_t *processed_out,
     size_t *skipped_out)
 {
+    smoothed_contig_t *contigs = NULL;
+    size_t contig_count = 0;
     size_t processed = 0;
     size_t skipped = 0;
+    double weighted_sum = 0.0;
+    size_t total_bases = 0;
+    double genome_average = 0.0;
+    double normalise_factor = 1.0;
+
+    contigs = (smoothed_contig_t *)calloc(batch->count, sizeof(smoothed_contig_t));
+    if (contigs == NULL) {
+        fprintf(stderr, "pebble: out of memory\n");
+        return EXIT_FAILURE;
+    }
 
     for (size_t i = 0; i < batch->count; i++) {
         const pebble_coverage_t *entry = &batch->items[i];
@@ -418,7 +517,6 @@ static int process_batch(
         size_t out_len = 0;
         double *smoothed_track = NULL;
         pebble_status_t status;
-        pebble_io_status_t io_status;
 
         if (num_steps == 0U) {
             fprintf(
@@ -432,12 +530,13 @@ static int process_batch(
             continue;
         }
 
-        if (bigwig_writer != NULL && !pebble_chrom_sizes_contains(chrom_sizes, entry->chrom)) {
+        if (validate_chrom_sizes && !pebble_chrom_sizes_contains(chrom_sizes, entry->chrom)) {
             fprintf(
                 stderr,
                 "pebble: %s not found in chromosome sizes file\n",
                 entry->chrom
             );
+            free_smoothed_contigs(contigs, contig_count);
             if (processed_out != NULL) {
                 *processed_out = processed;
             }
@@ -450,6 +549,7 @@ static int process_batch(
         smoothed_track = (double *)malloc(num_steps * sizeof(double));
         if (smoothed_track == NULL) {
             fprintf(stderr, "pebble: out of memory\n");
+            free_smoothed_contigs(contigs, contig_count);
             if (processed_out != NULL) {
                 *processed_out = processed;
             }
@@ -470,6 +570,7 @@ static int process_batch(
         if (status != PEBBLE_OK) {
             print_status(status);
             free(smoothed_track);
+            free_smoothed_contigs(contigs, contig_count);
             if (processed_out != NULL) {
                 *processed_out = processed;
             }
@@ -479,49 +580,89 @@ static int process_batch(
             return EXIT_FAILURE;
         }
 
-        io_status = pebble_write_bedgraph(
-            bedgraph_output,
-            entry->chrom,
+        pebble_smoothed_genome_average_add(
             entry->start_offset,
             &options->config,
             smoothed_track,
-            out_len
+            out_len,
+            &weighted_sum,
+            &total_bases
         );
-        if (io_status != PEBBLE_IO_OK) {
-            free(smoothed_track);
-            if (processed_out != NULL) {
-                *processed_out = processed;
-            }
-            if (skipped_out != NULL) {
-                *skipped_out = skipped;
-            }
-            fprintf(stderr, "pebble: %s\n", pebble_io_status_string(io_status));
-            return EXIT_FAILURE;
-        }
 
-        if (bigwig_writer != NULL) {
-            io_status = pebble_bigwig_write_bedgraph(
-                bigwig_writer,
+        contigs[contig_count].entry = entry;
+        contigs[contig_count].values = smoothed_track;
+        contigs[contig_count].value_count = out_len;
+        contig_count++;
+        processed++;
+    }
+
+    if (total_bases > 0U) {
+        genome_average = weighted_sum / (double)total_bases;
+        normalise_factor = pebble_coverage_normalise_factor(genome_average);
+        fprintf(
+            stderr,
+            "pebble: genome average=%.2f, normalise factor=%.4f (avg/2), target mean=2.0\n",
+            genome_average,
+            normalise_factor
+        );
+    }
+
+    for (size_t i = 0; i < contig_count; i++) {
+        const pebble_coverage_t *entry = contigs[i].entry;
+        pebble_io_status_t io_status;
+
+        if (smoothed_output != NULL) {
+            io_status = pebble_write_bedgraph(
+                smoothed_output,
                 entry->chrom,
                 entry->start_offset,
                 &options->config,
-                smoothed_track,
-                out_len
+                contigs[i].values,
+                contigs[i].value_count
             );
-        }
-        free(smoothed_track);
-        if (io_status != PEBBLE_IO_OK) {
-            fprintf(stderr, "pebble: %s\n", pebble_io_status_string(io_status));
-            if (processed_out != NULL) {
-                *processed_out = processed;
+            if (io_status != PEBBLE_IO_OK) {
+                free_smoothed_contigs(contigs, contig_count);
+                if (processed_out != NULL) {
+                    *processed_out = processed;
+                }
+                if (skipped_out != NULL) {
+                    *skipped_out = skipped;
+                }
+                fprintf(stderr, "pebble: %s\n", pebble_io_status_string(io_status));
+                return EXIT_FAILURE;
             }
-            if (skipped_out != NULL) {
-                *skipped_out = skipped;
-            }
-            return EXIT_FAILURE;
         }
-        processed++;
+
+        pebble_normalise_smoothed_values(
+            contigs[i].values,
+            contigs[i].value_count,
+            normalise_factor
+        );
+
+        if (normalised_output != NULL) {
+            io_status = pebble_write_bedgraph(
+                normalised_output,
+                entry->chrom,
+                entry->start_offset,
+                &options->config,
+                contigs[i].values,
+                contigs[i].value_count
+            );
+            if (io_status != PEBBLE_IO_OK) {
+                free_smoothed_contigs(contigs, contig_count);
+                if (processed_out != NULL) {
+                    *processed_out = processed;
+                }
+                if (skipped_out != NULL) {
+                    *skipped_out = skipped;
+                }
+                fprintf(stderr, "pebble: %s\n", pebble_io_status_string(io_status));
+                return EXIT_FAILURE;
+            }
+        }
     }
+
+    free_smoothed_contigs(contigs, contig_count);
 
     if (processed_out != NULL) {
         *processed_out = processed;
@@ -532,15 +673,64 @@ static int process_batch(
     return EXIT_SUCCESS;
 }
 
+static int write_bigwig_from_bedgraph_file(
+    const char *bedgraph_path,
+    const char *bigwig_path,
+    const pebble_chrom_sizes_t *chrom_sizes)
+{
+    pebble_bedgraph_batch_t records = {0};
+    pebble_bigwig_writer_t *writer = NULL;
+    pebble_io_status_t io_status;
+
+    io_status = pebble_read_bedgraph_records(bedgraph_path, NULL, &records);
+    if (io_status != PEBBLE_IO_OK) {
+        fprintf(stderr, "pebble: failed to read BedGraph for BigWig (%s)\n", pebble_io_status_string(io_status));
+        return EXIT_FAILURE;
+    }
+
+    pebble_bedgraph_batch_sort(&records);
+
+    writer = pebble_bigwig_writer_create(bigwig_path, chrom_sizes);
+    if (writer == NULL) {
+        fprintf(stderr, "pebble: failed to create BigWig output file\n");
+        pebble_bedgraph_batch_free(&records);
+        return EXIT_FAILURE;
+    }
+
+    fprintf(
+        stderr,
+        "pebble: writing BigWig from BedGraph (%zu interval(s), same as bedGraphToBigWig)\n",
+        records.count
+    );
+
+    io_status = pebble_bigwig_write_records(writer, records.items, records.count);
+    if (io_status != PEBBLE_IO_OK) {
+        fprintf(stderr, "pebble: %s\n", pebble_io_status_string(io_status));
+        pebble_bigwig_writer_close(writer);
+        pebble_bedgraph_batch_free(&records);
+        return EXIT_FAILURE;
+    }
+
+    if (pebble_bigwig_writer_close(writer) != PEBBLE_IO_OK) {
+        fprintf(stderr, "pebble: failed to finalize BigWig output\n");
+        pebble_bedgraph_batch_free(&records);
+        return EXIT_FAILURE;
+    }
+
+    pebble_bedgraph_batch_free(&records);
+    return EXIT_SUCCESS;
+}
+
 static int run_file_mode(const cli_options_t *options)
 {
     pebble_coverage_batch_t batch = {0};
     pebble_chrom_sizes_t chrom_sizes = {0};
     pebble_io_status_t io_status;
-    FILE *bedgraph_output = stdout;
-    char *bedgraph_path = NULL;
+    FILE *smoothed_output = NULL;
+    FILE *normalised_output = stdout;
+    char *smoothed_path = NULL;
+    char *normalised_path = NULL;
     char *bigwig_path = NULL;
-    pebble_bigwig_writer_t *bigwig_writer = NULL;
     int exit_code = EXIT_SUCCESS;
     size_t processed = 0;
     size_t skipped = 0;
@@ -566,16 +756,31 @@ static int run_file_mode(const cli_options_t *options)
     pebble_coverage_batch_sort(&batch);
 
     if (options->output_path != NULL) {
-        bedgraph_path = derive_bedgraph_path(options->output_path);
-        if (bedgraph_path == NULL) {
+        normalised_path = derive_normalised_bedgraph_path(options->output_path);
+        smoothed_path = derive_smoothed_bedgraph_path(options->output_path);
+        if (normalised_path == NULL || smoothed_path == NULL) {
             fprintf(stderr, "pebble: out of memory\n");
+            free(normalised_path);
+            free(smoothed_path);
             pebble_coverage_batch_free(&batch);
             return EXIT_FAILURE;
         }
-        bedgraph_output = fopen(bedgraph_path, "w");
-        if (bedgraph_output == NULL) {
-            fprintf(stderr, "pebble: failed to open BedGraph output file\n");
-            free(bedgraph_path);
+
+        normalised_output = fopen(normalised_path, "w");
+        if (normalised_output == NULL) {
+            fprintf(stderr, "pebble: failed to open normalised BedGraph output file\n");
+            free(normalised_path);
+            free(smoothed_path);
+            pebble_coverage_batch_free(&batch);
+            return EXIT_FAILURE;
+        }
+
+        smoothed_output = fopen(smoothed_path, "w");
+        if (smoothed_output == NULL) {
+            fprintf(stderr, "pebble: failed to open smoothed BedGraph output file\n");
+            fclose(normalised_output);
+            free(normalised_path);
+            free(smoothed_path);
             pebble_coverage_batch_free(&batch);
             return EXIT_FAILURE;
         }
@@ -585,9 +790,11 @@ static int run_file_mode(const cli_options_t *options)
         bigwig_path = derive_bigwig_path(options->output_path);
         if (bigwig_path == NULL) {
             fprintf(stderr, "pebble: out of memory\n");
-            if (bedgraph_path != NULL) {
-                fclose(bedgraph_output);
-                free(bedgraph_path);
+            if (smoothed_path != NULL) {
+                fclose(smoothed_output);
+                fclose(normalised_output);
+                free(smoothed_path);
+                free(normalised_path);
             }
             pebble_coverage_batch_free(&batch);
             return EXIT_FAILURE;
@@ -600,61 +807,59 @@ static int run_file_mode(const cli_options_t *options)
                 "pebble: failed to read chromosome sizes (%s)\n",
                 pebble_io_status_string(io_status)
             );
-            if (bedgraph_path != NULL) {
-                fclose(bedgraph_output);
-                free(bedgraph_path);
+            if (smoothed_path != NULL) {
+                fclose(smoothed_output);
+                fclose(normalised_output);
+                free(smoothed_path);
+                free(normalised_path);
             }
             free(bigwig_path);
             pebble_coverage_batch_free(&batch);
             return EXIT_FAILURE;
         }
 
-        bigwig_writer = pebble_bigwig_writer_create(bigwig_path, &chrom_sizes);
-        if (bigwig_writer == NULL) {
-            fprintf(stderr, "pebble: failed to create BigWig output file\n");
-            if (bedgraph_path != NULL) {
-                fclose(bedgraph_output);
-                free(bedgraph_path);
-            }
-            free(bigwig_path);
-            pebble_chrom_sizes_free(&chrom_sizes);
-            pebble_coverage_batch_free(&batch);
-            return EXIT_FAILURE;
-        }
-
-        fprintf(stderr, "pebble: writing BedGraph");
-        if (bedgraph_path != NULL) {
-            fprintf(stderr, " to %s", bedgraph_path);
-        } else {
-            fprintf(stderr, " to stdout");
-        }
-        fprintf(stderr, " and BigWig to %s\n", bigwig_path);
-    } else if (bedgraph_path != NULL) {
-        fprintf(stderr, "pebble: writing BedGraph to %s\n", bedgraph_path);
+        fprintf(
+            stderr,
+            "pebble: writing smoothed BedGraph to %s, normalised BedGraph to %s; BigWig from normalised -> %s\n",
+            smoothed_path,
+            normalised_path,
+            bigwig_path
+        );
+    } else if (normalised_path != NULL) {
+        fprintf(
+            stderr,
+            "pebble: writing smoothed BedGraph to %s, normalised BedGraph to %s\n",
+            smoothed_path,
+            normalised_path
+        );
+    } else {
+        fprintf(stderr, "pebble: writing normalised BedGraph to stdout (smoothed not written)\n");
     }
 
     exit_code = process_batch(
         &batch,
         options,
-        bedgraph_output,
-        bigwig_writer,
+        smoothed_output,
+        normalised_output,
         &chrom_sizes,
+        options->want_bigwig,
         &processed,
         &skipped
     );
 
-    if (bigwig_writer != NULL) {
-        io_status = pebble_bigwig_writer_close(bigwig_writer);
-        if (io_status != PEBBLE_IO_OK && exit_code == EXIT_SUCCESS) {
-            fprintf(stderr, "pebble: failed to finalize BigWig output\n");
+    if (smoothed_path != NULL) {
+        if (fclose(smoothed_output) != 0 && exit_code == EXIT_SUCCESS) {
+            fprintf(stderr, "pebble: failed to close smoothed BedGraph output file\n");
+            exit_code = EXIT_FAILURE;
+        }
+        if (fclose(normalised_output) != 0 && exit_code == EXIT_SUCCESS) {
+            fprintf(stderr, "pebble: failed to close normalised BedGraph output file\n");
             exit_code = EXIT_FAILURE;
         }
     }
-    if (bedgraph_path != NULL) {
-        if (fclose(bedgraph_output) != 0 && exit_code == EXIT_SUCCESS) {
-            fprintf(stderr, "pebble: failed to close BedGraph output file\n");
-            exit_code = EXIT_FAILURE;
-        }
+
+    if (exit_code == EXIT_SUCCESS && options->want_bigwig && normalised_path != NULL) {
+        exit_code = write_bigwig_from_bedgraph_file(normalised_path, bigwig_path, &chrom_sizes);
     }
 
     fprintf(
@@ -673,7 +878,8 @@ static int run_file_mode(const cli_options_t *options)
         exit_code = EXIT_FAILURE;
     }
 
-    free(bedgraph_path);
+    free(smoothed_path);
+    free(normalised_path);
     free(bigwig_path);
     pebble_chrom_sizes_free(&chrom_sizes);
     pebble_coverage_batch_free(&batch);
@@ -690,9 +896,10 @@ static int run_convert_mode(const cli_options_t *options)
     int exit_code = EXIT_SUCCESS;
     size_t i;
 
-    io_status = pebble_read_bedgraph_records(
+    io_status = pebble_read_interval_records(
         options->input_path,
         options->chrom_filter,
+        options->format == PEBBLE_FORMAT_BED ? 1 : 0,
         &batch
     );
     if (io_status != PEBBLE_IO_OK) {
@@ -753,7 +960,7 @@ static int run_convert_mode(const cli_options_t *options)
 
     fprintf(
         stderr,
-        "pebble: converting BedGraph to BigWig (no smoothing) -> %s\n",
+        "pebble: converting to BigWig (no smoothing, bedGraphToBigWig-style) -> %s\n",
         bigwig_path
     );
 

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libpebble_core.a CMakeFiles/pebble_core.dir/src/pebble.c.o CMakeFiles/pebble_core.dir/src/pebble_io.c.o CMakeFiles/pebble_core.dir/src/pebble_bigwig_stub.c.o
+/usr/bin/ranlib libpebble_core.a
