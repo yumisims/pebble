@@ -802,7 +802,20 @@ void pebble_normalise_smoothed_values(
     }
 
     for (idx = 0; idx < value_count; idx++) {
-        values[idx] /= normalise_factor;
+        values[idx] = (double)round_coverage(values[idx] / normalise_factor);
+    }
+}
+
+void pebble_round_smoothed_values(double *values, size_t value_count)
+{
+    size_t idx;
+
+    if (values == NULL) {
+        return;
+    }
+
+    for (idx = 0; idx < value_count; idx++) {
+        values[idx] = (double)round_coverage(values[idx]);
     }
 }
 
@@ -821,10 +834,11 @@ pebble_io_status_t pebble_write_bedgraph(
     for (size_t idx = 0; idx < value_count; idx++) {
         int start = 0;
         int end = 0;
+        int value = round_coverage(values[idx]);
 
         pebble_output_interval(idx, start_offset, config, &start, &end);
 
-        if (fprintf(out, "%s\t%d\t%d\t%d\n", chrom, start, end, round_coverage(values[idx])) < 0) {
+        if (fprintf(out, "%s\t%d\t%d\t%d\n", chrom, start, end, value) < 0) {
             return PEBBLE_IO_ERR_IO;
         }
     }

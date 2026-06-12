@@ -133,6 +133,98 @@ static void test_write_bedgraph_roundtrip(void)
     pebble_coverage_batch_free(&batch);
 }
 
+static int bedgraph_fourth_column_is_integer(const char *line)
+{
+    const char *field = line;
+    const char *next = NULL;
+    size_t tab_count = 0;
+
+    while (tab_count < 3U) {
+        next = strchr(field, '\t');
+        if (next == NULL) {
+            return 0;
+        }
+        field = next + 1;
+        tab_count++;
+    }
+
+    if (*field == '\0' || *field == '\n' || *field == '\r') {
+        return 0;
+    }
+
+    while (*field != '\0' && *field != '\n' && *field != '\r') {
+        if (*field == '.' || *field == 'e' || *field == 'E') {
+            return 0;
+        }
+        field++;
+    }
+
+    return 1;
+}
+
+static void assert_bedgraph_integer_columns(FILE *handle)
+{
+    char line[256];
+
+    rewind(handle);
+    while (fgets(line, sizeof(line), handle) != NULL) {
+        assert(bedgraph_fourth_column_is_integer(line));
+    }
+}
+
+static void test_bedgraph_fourth_column_is_integer(void)
+{
+    pebble_config_t config = {
+        .window_size = 1000,
+        .step_size = 100,
+        .trim_low = 0.40,
+        .trim_high = 0.40,
+    };
+    pebble_coverage_batch_t batch = {0};
+    double *smoothed = NULL;
+    double *normalised = NULL;
+    size_t out_len = 0;
+    size_t num_steps = 0;
+    double weighted_sum = 0.0;
+    size_t total_bases = 0;
+    double normalise_factor = 1.0;
+    FILE *smoothed_tmp = tmpfile();
+    FILE *normalised_tmp = tmpfile();
+
+    assert(smoothed_tmp != NULL);
+    assert(normalised_tmp != NULL);
+    assert(pebble_read_bed("examples/example_cov.bed", "scaffold_1", &batch) == PEBBLE_IO_OK);
+    num_steps = pebble_output_count(batch.items[0].length, &config);
+    smoothed = (double *)malloc(num_steps * sizeof(double));
+    normalised = (double *)malloc(num_steps * sizeof(double));
+    assert(smoothed != NULL);
+    assert(normalised != NULL);
+    assert(
+        pebble_process(batch.items[0].coverage, batch.items[0].length, &config, smoothed, num_steps, &out_len)
+        == PEBBLE_OK
+    );
+    assert(out_len >= 1U);
+
+    pebble_smoothed_genome_average_add(0, &config, smoothed, out_len, &weighted_sum, &total_bases);
+    assert(total_bases > 0U);
+    normalise_factor = pebble_coverage_normalise_factor(weighted_sum / (double)total_bases);
+
+    memcpy(normalised, smoothed, out_len * sizeof(double));
+    pebble_round_smoothed_values(smoothed, out_len);
+    assert(pebble_write_bedgraph(smoothed_tmp, "scaffold_1", 0, &config, smoothed, out_len) == PEBBLE_IO_OK);
+    assert_bedgraph_integer_columns(smoothed_tmp);
+
+    pebble_normalise_smoothed_values(normalised, out_len, normalise_factor);
+    assert(pebble_write_bedgraph(normalised_tmp, "scaffold_1", 0, &config, normalised, out_len) == PEBBLE_IO_OK);
+    assert_bedgraph_integer_columns(normalised_tmp);
+
+    free(smoothed);
+    free(normalised);
+    fclose(smoothed_tmp);
+    fclose(normalised_tmp);
+    pebble_coverage_batch_free(&batch);
+}
+
 static void test_coverage_normalisation(void)
 {
     pebble_config_t config = {
@@ -278,6 +370,7 @@ int main(void)
     test_batch_sort();
     test_gap_fill_at_start();
     test_write_bedgraph_roundtrip();
+    test_bedgraph_fourth_column_is_integer();
     test_coverage_normalisation();
 #ifdef PEBBLE_BIGWIG
     test_write_bigwig_roundtrip();

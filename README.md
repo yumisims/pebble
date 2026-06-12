@@ -1,6 +1,6 @@
 # Pebble
 
-**Authors:** Yumi Sims, Jo Wood, Zemin Ning
+**Authors:** Yumi Sims, Danil Zilov, Jo Wood, Zemin Ning
 
 Pebble is a command-line tool and C library for smoothing genomic sequencing coverage tracks. It reads per-base coverage from BED or BedGraph files, applies a sliding trimmed mean, and writes the result as BedGraph or BigWig.
 
@@ -24,7 +24,7 @@ Example output coordinates for the first three steps on a contig starting at 0:
 | 1 | 100–1099 | 100–200 | mean of middle 200 in window |
 | 2 | 200–1199 | 200–300 | mean of middle 200 in window |
 
-Contigs shorter than the window size are skipped. Smoothed values are **rounded to the nearest integer** in the output BedGraph.
+Contigs shorter than the window size are skipped. The fourth column of every BedGraph row is a **rounded integer** in both smoothed and normalised output.
 
 ### Coverage normalisation
 
@@ -61,17 +61,20 @@ Pebble logs the genome average and normalise factor to stderr, for example:
 pebble: genome average=54.24, normalise factor=27.1180 (avg/2), target mean=2.0
 ```
 
-**Output files.** When `-o` is given, Pebble writes **both** tracks:
+**Output files.** Pebble always writes **both** BedGraph tracks:
 
 | File | Contents |
 |------|----------|
-| `*.smoothed.bedgraph` | Raw smoothed coverage |
-| `*.normalised.bedgraph` (or the `-o` path if it is not already `*.smoothed.bedgraph`) | Normalised coverage |
+| `<basename>.smoothed.bedgraph` | Raw smoothed coverage |
+| `<basename>.normalised.bedgraph` | Normalised coverage |
 
-Path rules:
+The basename comes from `-o` (extension stripped) or from the input filename when `-o` is omitted.
 
-- `-o out.bedgraph` → `out.smoothed.bedgraph` + `out.bedgraph` (normalised)
-- `-o sample.smoothed.bedgraph` → `sample.smoothed.bedgraph` + `sample.normalised.bedgraph`
+Examples:
+
+- `-i cov.bed` → `cov.smoothed.bedgraph` + `cov.normalised.bedgraph`
+- `-o build/out.bedgraph` → `build/out.smoothed.bedgraph` + `build/out.normalised.bedgraph`
+- `-o build/sample.smoothed.bedgraph` → `build/sample.smoothed.bedgraph` + `build/sample.normalised.bedgraph`
 
 BigWig (with `--sizes`) is built from the **normalised** BedGraph. Demo mode (`--demo`) prints both smoothed and normalised columns to stdout.
 
@@ -151,7 +154,7 @@ Example data in `examples/`:
 ./build/pebble -i examples/example_cov.bed \
   -o build/example_cov.smoothed.bedgraph \
   --sizes examples/chrom.sizes
-# -> build/example_cov.smoothed.bedgraph + build/example_cov.normalised.bedgraph + build/example_cov.smoothed.bw
+# -> build/example_cov.smoothed.bedgraph + build/example_cov.normalised.bedgraph + build/example_cov.bw
 
 # BedGraph to BigWig without smoothing (pass-through; input must be .bedgraph)
 ./build/pebble -i raw.bedgraph \
@@ -194,7 +197,7 @@ For deep coverage (e.g. peaks ~800), rely on auto ymax or set explicitly: `--yma
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-i input` | Input BED or BedGraph file | — |
-| `-o output` | Normalised BedGraph path; also writes companion `*.smoothed.bedgraph` | stdout (normalised only) |
+| `-o output` | Output basename (writes `<basename>.smoothed.bedgraph` and `<basename>.normalised.bedgraph`; default: input basename) | input basename |
 | `--sizes file` | Chromosome sizes (`name<TAB>length`); also writes a `.bw` alongside BedGraph | — |
 | `--no-smooth` | Convert coverage BED/BedGraph to BigWig without smoothing (requires `--sizes`, `-o`) | off |
 | `--format-out bedgraph\|bigwig` | With `--sizes`, treat `-o` as BigWig basename when set to `bigwig` | BedGraph always; BigWig when `--sizes` given |
@@ -232,8 +235,8 @@ Pebble builds a dense per-base coverage array for each contig from the input int
 
 | Format | When | Notes |
 |--------|------|-------|
-| BedGraph (smoothed) | `-o` path given | 4 columns: `chrom start end smoothed_coverage` |
-| BedGraph (normalised) | `-o` path given, or stdout if no `-o` | 4 columns: `chrom start end normalised_coverage`; genome-wide mean ≈ 2 |
+| BedGraph (smoothed) | always | `<basename>.smoothed.bedgraph` |
+| BedGraph (normalised) | always | `<basename>.normalised.bedgraph`; genome-wide mean ≈ 2 |
 | BigWig | with `--sizes` (from normalised BedGraph), or `--no-smooth` (direct BedGraph conversion) | Requires `-o` and `-DPEBBLE_BIGWIG=ON` build |
 
 BedGraph intervals use `[window_start, window_start + step)` and coverage values are rounded integers. BigWig carries the same intervals and values in binary form; the chromosome sizes file supplies the sequence lengths for the BigWig header (UCSC `chrom.sizes` format: one `name<TAB>length` per line, `#` comments allowed).

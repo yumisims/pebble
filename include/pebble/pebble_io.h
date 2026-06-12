@@ -152,6 +152,15 @@ void pebble_normalise_smoothed_values(
     double normalise_factor
 );
 
+/*
+ * Round smoothed values to the nearest integer (in place).
+ * BedGraph column 4 is always written as an integer.
+ */
+void pebble_round_smoothed_values(
+    double *values,
+    size_t value_count
+);
+
 const char *pebble_io_status_string(pebble_io_status_t status);
 
 #endif /* PEBBLE_PEBBLE_IO_H */
