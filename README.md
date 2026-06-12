@@ -2,7 +2,7 @@
 
 **Authors:** Yumi Sims, Danil Zilov, Jo Wood, Zemin Ning
 
-Pebble is a command-line tool and C library for smoothing genomic sequencing coverage tracks. It reads per-base coverage from BED or BedGraph files, applies a sliding trimmed mean, and writes the result as BedGraph or BigWig.
+Pebble is a command-line tool and C library for smoothing genomic sequencing coverage tracks. It reads per-base coverage from BED or BedGraph files, applies a sliding trimmed mean, normalises coverage to a diploid baseline, and writes **smoothed** and **normalised** BedGraph files (and optionally BigWig).
 
 The algorithm follows the coverage-smoothing approach used in [stepStone](https://github.com/wtsi-hpag/stepStone) (`-denoise 1`): within each sliding window, extreme values are trimmed before averaging. This suppresses spikes from mapping artifacts, repeats, and other outliers while preserving broad coverage trends.
 
@@ -163,17 +163,21 @@ Example data in `examples/`:
   --no-smooth
 ```
 
-Other input types:
+Other input types (each command writes both `<basename>.smoothed.bedgraph` and `<basename>.normalised.bedgraph`):
 
 ```bash
 # BedGraph input
-./build/pebble -i track.bedgraph -o smoothed.bedgraph
+./build/pebble -i track.bedgraph -o track
 
 # Standard 6-column BED (score in column 5)
-./build/pebble -i regions.bed -f bed -o smoothed.bedgraph
+./build/pebble -i regions.bed -f bed -o regions
 
-# Custom window/step (e.g. short contigs)
-./build/pebble -i examples/genome2cov_style.bed -W 50 -S 10 -o smoothed.bedgraph
+# Custom window/step (e.g. 100 kb window, 100 bp step)
+./build/pebble -i examples/example_cov.bed -W 100000 -S 100 -o build/example_cov
+
+# Omit -o to write next to the input file
+./build/pebble -i examples/example_cov.bed -c scaffold_1
+# -> examples/example_cov.smoothed.bedgraph + examples/example_cov.normalised.bedgraph
 ```
 
 ### Coverage plots (stepStone style)
@@ -211,12 +215,12 @@ For deep coverage (e.g. peaks ~800), rely on auto ymax or set explicitly: `--yma
 
 If no input file is given, Pebble runs in demo mode.
 
-BigWig output uses [libBigWig](https://github.com/dpryan79/libBigWig). Enable it at build time with `-DPEBBLE_BIGWIG=ON` (CMake) or `make PEBBLE_BIGWIG=1`. **BedGraph is always written** (smoothed and normalised when `-o` is a file). When `--sizes` is given, Pebble also writes a `.bw` file from the **normalised** BedGraph (same intervals as UCSC `bedGraphToBigWig`). Every contig in the BigWig must appear in the chromosome sizes file.
+BigWig output uses [libBigWig](https://github.com/dpryan79/libBigWig). Enable it at build time with `-DPEBBLE_BIGWIG=ON` (CMake) or `make PEBBLE_BIGWIG=1`. **Both BedGraph tracks are always written** (`*.smoothed.bedgraph` and `*.normalised.bedgraph`). When `--sizes` is given, Pebble also writes a `.bw` file from the **normalised** BedGraph (same intervals as UCSC `bedGraphToBigWig`). Every contig in the BigWig must appear in the chromosome sizes file.
 
 You can also convert an existing BedGraph with UCSC tools if you prefer:
 
 ```bash
-bedGraphToBigWig smoothed.bedgraph chrom.sizes smoothed.bw
+bedGraphToBigWig example.normalised.bedgraph chrom.sizes example.bw
 ```
 
 ## Input and output
@@ -235,11 +239,11 @@ Pebble builds a dense per-base coverage array for each contig from the input int
 
 | Format | When | Notes |
 |--------|------|-------|
-| BedGraph (smoothed) | always | `<basename>.smoothed.bedgraph` |
-| BedGraph (normalised) | always | `<basename>.normalised.bedgraph`; genome-wide mean ≈ 2 |
-| BigWig | with `--sizes` (from normalised BedGraph), or `--no-smooth` (direct BedGraph conversion) | Requires `-o` and `-DPEBBLE_BIGWIG=ON` build |
+| BedGraph (smoothed) | always | `<basename>.smoothed.bedgraph`; column 4 is a rounded integer |
+| BedGraph (normalised) | always | `<basename>.normalised.bedgraph`; column 4 is a rounded integer; genome-wide mean ≈ 2 |
+| BigWig | with `--sizes` (from normalised BedGraph), or `--no-smooth` (direct BedGraph conversion) | Requires `-DPEBBLE_BIGWIG=ON` build; `-o` sets basename |
 
-BedGraph intervals use `[window_start, window_start + step)` and coverage values are rounded integers. BigWig carries the same intervals and values in binary form; the chromosome sizes file supplies the sequence lengths for the BigWig header (UCSC `chrom.sizes` format: one `name<TAB>length` per line, `#` comments allowed).
+All BedGraph rows use `[window_start, window_start + step)` coordinates. BigWig carries the same intervals and values in binary form; the chromosome sizes file supplies the sequence lengths for the BigWig header (UCSC `chrom.sizes` format: one `name<TAB>length` per line, `#` comments allowed).
 
 **Chromosome sizes file** — tab- or space-separated, one sequence per line (see `examples/chrom.sizes`):
 
@@ -269,12 +273,30 @@ pebble_config_t config = {
 };
 
 size_t n = pebble_output_count(coverage_len, &config);
-double *out = malloc(n * sizeof(double));
+double *smoothed = malloc(n * sizeof(double));
 size_t out_len;
+double weighted_sum = 0.0;
+size_t total_bases = 0;
+double normalise_factor;
 
-pebble_process(coverage, coverage_len, &config, out, n, &out_len);
-pebble_write_bedgraph_file("out.bedgraph", "chr1", 0, &config, out, out_len);
+pebble_process(coverage, coverage_len, &config, smoothed, n, &out_len);
+pebble_smoothed_genome_average_add(0, &config, smoothed, out_len, &weighted_sum, &total_bases);
+normalise_factor = pebble_coverage_normalise_factor(weighted_sum / (double)total_bases);
+
+pebble_round_smoothed_values(smoothed, out_len);
+pebble_write_bedgraph_file("out.smoothed.bedgraph", "chr1", 0, &config, smoothed, out_len);
+
+pebble_normalise_smoothed_values(smoothed, out_len, normalise_factor);
+pebble_write_bedgraph_file("out.normalised.bedgraph", "chr1", 0, &config, smoothed, out_len);
 ```
+
+Key I/O helpers in `pebble_io.h`:
+
+- `pebble_smoothed_genome_average_add()` — accumulate length-weighted genome average
+- `pebble_coverage_normalise_factor()` — `genome_average / 2`
+- `pebble_normalise_smoothed_values()` — divide and round to integer coverage
+- `pebble_round_smoothed_values()` — round smoothed values before writing
+- `pebble_write_bedgraph()` — write 4-column BedGraph (column 4 always integer)
 
 Link against `pebble_core` and include the `include/` directory.
 
@@ -299,7 +321,7 @@ make example   # mock scaffold demo (small; see examples/mock_scaffold.bedgraph)
 ./build/pebble -i examples/example_cov.bed \
   -o build/example_cov.smoothed.bedgraph \
   --sizes examples/chrom.sizes
-# -> build/example_cov.smoothed.bedgraph, build/example_cov.normalised.bedgraph, build/example_cov.smoothed.bw
+# -> build/example_cov.smoothed.bedgraph, build/example_cov.normalised.bedgraph, build/example_cov.bw
 ```
 
 Unit tests also use smaller fixtures (`examples/mock_scaffold.bedgraph`, `examples/genome2cov_style.bed`).
