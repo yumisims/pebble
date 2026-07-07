@@ -20,40 +20,59 @@ static int config_is_valid(const pebble_config_t *config)
     return 1;
 }
 
-static void clear_counts(uint32_t *counts, int hist_max)
-{
-    for (int v = 0; v <= hist_max; v++) {
-        counts[v] = 0U;
-    }
-}
-
-static double trimmed_mean_window(
+static void histogram_add_range(
     const int16_t *coverage,
-    size_t start,
-    int window_size,
-    int low_idx,
-    int high_idx,
+    size_t from,
+    size_t to,
     uint32_t *counts,
     int *hist_max)
 {
-    int wmax = 0;
+    size_t k;
+
+    for (k = from; k < to; k++) {
+        int idx = (int)(uint16_t)coverage[k];
+
+        counts[idx]++;
+        if (idx > *hist_max) {
+            *hist_max = idx;
+        }
+    }
+}
+
+static void histogram_remove_range(
+    const int16_t *coverage,
+    size_t from,
+    size_t to,
+    uint32_t *counts,
+    int *hist_max)
+{
+    size_t k;
+
+    for (k = from; k < to; k++) {
+        int idx = (int)(uint16_t)coverage[k];
+
+        counts[idx]--;
+    }
+
+    while (*hist_max > 0 && counts[*hist_max] == 0U) {
+        (*hist_max)--;
+    }
+}
+
+static double trimmed_mean_from_histogram(
+    const uint32_t *counts,
+    int hist_max,
+    int low_idx,
+    int high_idx)
+{
     int need_skip = low_idx;
     int need_take = high_idx - low_idx;
     int64_t sum = 0;
+    int v;
 
-    *hist_max = 0;
-
-    for (int k = 0; k < window_size; k++) {
-        int idx = (int)(uint16_t)coverage[start + (size_t)k];
-        counts[idx]++;
-        if (idx > wmax) {
-            wmax = idx;
-        }
-    }
-    *hist_max = wmax;
-
-    for (int v = 0; v <= wmax && need_take > 0; v++) {
+    for (v = 0; v <= hist_max && need_take > 0; v++) {
         uint32_t c = counts[v];
+
         if (c == 0U) {
             continue;
         }
@@ -63,15 +82,18 @@ static double trimmed_mean_window(
                 need_skip -= (int)c;
                 continue;
             }
+
             {
                 int avail = (int)c - need_skip;
                 int take = avail < need_take ? avail : need_take;
+
                 need_skip = 0;
                 sum += (int64_t)v * take;
                 need_take -= take;
             }
         } else {
             int take = (int)c < need_take ? (int)c : need_take;
+
             sum += (int64_t)v * take;
             need_take -= take;
         }
@@ -106,6 +128,8 @@ pebble_status_t pebble_process(
     double trimmed_len;
     uint32_t *counts = NULL;
     int hist_max = 0;
+    size_t window_size;
+    size_t step_size;
 
     if (coverage == NULL || config == NULL || out == NULL || out_len == NULL) {
         return PEBBLE_ERR_INVALID_ARG;
@@ -134,24 +158,31 @@ pebble_status_t pebble_process(
         return PEBBLE_ERR_INVALID_ARG;
     }
 
+    window_size = (size_t)config->window_size;
+    step_size = (size_t)config->step_size;
+
     counts = (uint32_t *)calloc(65536U, sizeof(uint32_t));
     if (counts == NULL) {
         return PEBBLE_ERR_INVALID_ARG;
     }
 
     for (size_t i = 0; i < num_steps; i++) {
-        size_t start = i * (size_t)config->step_size;
+        size_t start = i * step_size;
 
-        out[i] = trimmed_mean_window(
-            coverage,
-            start,
-            config->window_size,
-            low_idx,
-            high_idx,
-            counts,
-            &hist_max
-        );
-        clear_counts(counts, hist_max);
+        if (i == 0U) {
+            histogram_add_range(coverage, start, start + window_size, counts, &hist_max);
+        } else {
+            histogram_remove_range(coverage, start - step_size, start, counts, &hist_max);
+            histogram_add_range(
+                coverage,
+                start + window_size - step_size,
+                start + window_size,
+                counts,
+                &hist_max
+            );
+        }
+
+        out[i] = trimmed_mean_from_histogram(counts, hist_max, low_idx, high_idx);
     }
 
     free(counts);

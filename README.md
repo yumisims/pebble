@@ -11,10 +11,10 @@ The algorithm follows the coverage-smoothing approach used in [stepStone](https:
 With the default settings (`-W 1000`, `-S 100`, `--trim-low 0.40`, `--trim-high 0.40`):
 
 1. Take a **1000 bp window** of per-base coverage (first window: bases 0–999).
-2. **Sort** the 1000 values and discard the lowest 400 and highest 400.
-3. Compute the **mean of the middle 200** values. This is the smoothed coverage for the window start.
+2. Build a **histogram** of the 1000 coverage values (counts per integer depth).
+3. Read off the trimmed mean from the histogram: skip the lowest 400 and highest 400 counts, then average the middle 200 values. This avoids sorting the window (`O(W log W)`) and is `O(W + V)` per step, where `V` is the max coverage value in the window.
 4. Write that value as a BedGraph interval `[window_start, window_start + step)`.
-5. **Slide the window forward by 100 bp** (next window: bases 100–1099, output interval 100–200) and repeat.
+5. **Slide the window forward by 100 bp**, updating the histogram incrementally (drop 100 leaving bases, add 100 entering bases), and repeat.
 
 Example output coordinates for the first three steps on a contig starting at 0:
 
@@ -332,6 +332,6 @@ Pebble implements the sliding-window trimmed-mean smoothing used in stepStone's 
 
 > Zemin Ning. stepStone: a pipeline for identification of chromothripsis breakpoints and cancer rearrangements. GitHub: https://github.com/wtsi-hpag/stepStone
 
-stepStone's coverage plot command documents `-denoise 1` as averaging data points after filtering high and low values within the window size. Pebble's default parameters (`-W 1000`, `-S 100`, `--trim-low 0.40`, `--trim-high 0.40`) match that trimming behaviour (middle 20% mean of a 1000 bp window). See `tests/test_pebble.c` for validation.
+stepStone's coverage plot command documents `-denoise 1` as averaging data points after filtering high and low values within the window size. Pebble's default parameters (`-W 1000`, `-S 100`, `--trim-low 0.40`, `--trim-high 0.40`) match that trimming behaviour (middle 20% mean of a 1000 bp window), implemented with a sliding histogram rather than per-window sorting. See `tests/test_pebble.c` for validation.
 
 For questions about stepStone, contact Zemin Ning (zn1@sanger.ac.uk).

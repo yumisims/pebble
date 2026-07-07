@@ -26,6 +26,7 @@ size_t pebble_output_count(size_t coverage_len, const pebble_config_t *config);
 
 /*
  * Processes a single chromosome's raw coverage array using a sliding trimmed mean.
+ * Each window uses a coverage histogram (not sorting) to compute the trimmed mean.
  *
  * out must point to at least pebble_output_count(...) elements.
  * On success, *out_len receives the number of values written to out.
